@@ -22,6 +22,19 @@ pub enum Session {
     LocalActive,
 }
 
+impl Session {
+    /// The state of a logind session from its `Remote`, `Seat` (the seat id, empty without one) and
+    /// `Active` properties. Local needs a seat: sessions without one, such as each user's
+    /// `manager` session, are reported active and not remote, but nobody sits at them.
+    pub fn from_logind(remote: bool, seat: &str, active: bool) -> Self {
+        match (!remote && !seat.is_empty(), active) {
+            (false, _) => Self::NotLocal,
+            (true, false) => Self::LocalInactive,
+            (true, true) => Self::LocalActive,
+        }
+    }
+}
+
 /// The subject of a check, once identified.
 #[derive(Debug, Clone)]
 pub struct Subject {
@@ -176,28 +189,27 @@ mod tests {
 
     #[test]
     fn unknown_actions_are_denied_even_by_a_yes_rule() {
-        let rules = rules("[[rule]]\nactions = [\"*\"]\nresult = \"yes\"\n");
+        let rules = rules("[[rule]]\nactions = [\"org.example.*\"]\nresult = \"yes\"\n");
         let alice = subject("alice", &[], Session::LocalActive);
+        let decide_for = |action| decide(&actions(), &rules, action, &alice, &no_details());
+        assert_eq!(decide_for("org.example.unknown"), No);
+        assert_eq!(decide_for("org.example.reboot"), Yes);
+    }
+
+    #[test]
+    fn local_sessions_need_a_seat() {
         assert_eq!(
-            decide(
-                &actions(),
-                &rules,
-                "org.example.unknown",
-                &alice,
-                &no_details()
-            ),
-            No
+            Session::from_logind(false, "seat0", true),
+            Session::LocalActive
         );
         assert_eq!(
-            decide(
-                &actions(),
-                &rules,
-                "org.example.reboot",
-                &alice,
-                &no_details()
-            ),
-            Yes
+            Session::from_logind(false, "seat0", false),
+            Session::LocalInactive
         );
+        // The user manager's session: no seat, not remote, active.
+        assert_eq!(Session::from_logind(false, "", true), Session::NotLocal);
+        assert_eq!(Session::from_logind(true, "seat0", true), Session::NotLocal);
+        assert_eq!(Session::from_logind(true, "", false), Session::NotLocal);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 
 use crate::{Authorization, is_valid_action_id, read_config_file};
 use roxmltree::Node;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// The directory polkit(8) installs action files in.
@@ -169,8 +169,9 @@ fn add_text(text: &mut Text, element: Node) {
     }
 }
 
-/// Loads every `*.policy` file of a directory, in name order. Returns the actions and the problems
-/// to log: a file that fails is skipped, and an action id defined twice keeps its first definition.
+/// Loads every `*.policy` file of a directory. Returns the actions and the problems to log: a file
+/// that fails is skipped, and an action id defined in two files is dropped, so it is denied (which
+/// definition is right cannot be known).
 pub fn load_actions(directory: &Path) -> (Actions, Vec<String>) {
     let mut actions = Actions::new();
     let mut problems = Vec::new();
@@ -188,6 +189,7 @@ pub fn load_actions(directory: &Path) -> (Actions, Vec<String>) {
         }
     };
     paths.sort();
+    let mut defined_twice = BTreeSet::new();
     for path in paths {
         let parsed = read_config_file(&path).and_then(|xml| {
             parse_policy(&xml).map_err(|error| format!("{}: {error}", path.display()))
@@ -195,12 +197,14 @@ pub fn load_actions(directory: &Path) -> (Actions, Vec<String>) {
         match parsed {
             Ok(file_actions) => {
                 for action in file_actions {
-                    if actions.contains_key(&action.id) {
+                    if actions.contains_key(&action.id) || defined_twice.contains(&action.id) {
                         problems.push(format!(
-                            "{}: action {} is already defined, ignored here",
+                            "{}: action {} is defined more than once; it stays unknown (denied)",
                             path.display(),
                             action.id
                         ));
+                        actions.remove(&action.id);
+                        defined_twice.insert(action.id);
                     } else {
                         actions.insert(action.id.clone(), action);
                     }
@@ -336,14 +340,19 @@ mod tests {
             std::env::temp_dir().join(format!("nyra-polkit-actions-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("a.policy"), POLICY).unwrap();
-        std::fs::write(directory.join("b.policy"), POLICY).unwrap();
-        std::fs::write(directory.join("c.policy"), "<policyconfig>").unwrap();
-        std::fs::write(directory.join("d.txt"), "ignored").unwrap();
+        let other = r#"<policyconfig><action id="org.example.other"/></policyconfig>"#;
+        std::fs::write(directory.join("b.policy"), other).unwrap();
+        // Defines org.example.disk.mount a second time.
+        let again = r#"<policyconfig><action id="org.example.disk.mount"/></policyconfig>"#;
+        std::fs::write(directory.join("c.policy"), again).unwrap();
+        std::fs::write(directory.join("d.policy"), "<policyconfig>").unwrap();
+        std::fs::write(directory.join("e.txt"), "ignored").unwrap();
         let (actions, problems) = load_actions(&directory);
         std::fs::remove_dir_all(&directory).unwrap();
-        assert_eq!(actions.len(), 2);
-        assert_eq!(problems.len(), 3, "{problems:?}");
-        assert!(problems[0].contains("b.policy") && problems[0].contains("already defined"));
-        assert!(problems[2].contains("c.policy") && problems[2].contains("denied"));
+        let ids: Vec<_> = actions.keys().collect();
+        assert_eq!(ids, ["org.example.disk.check", "org.example.other"]);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("c.policy") && problems[0].contains("more than once"));
+        assert!(problems[1].contains("d.policy") && problems[1].contains("denied"));
     }
 }
