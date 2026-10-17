@@ -16,7 +16,12 @@ fn main() -> ExitCode {
         eprintln!("<4>{problem}");
     }
     let rules = match load_rules(Path::new(IMAGE_RULES_DIR), Path::new(LOCAL_RULES_DIR)) {
-        Ok(rules) => rules,
+        Ok((rules, notes)) => {
+            for note in &notes {
+                println!("<6>{note}");
+            }
+            rules
+        }
         Err(error) => {
             // The service will deny every request in this state (docs/DESIGN.md, "Rules").
             eprintln!("<3>{error}; every request would be denied until it is fixed");

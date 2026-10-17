@@ -10,6 +10,7 @@ pub mod decision;
 pub mod rules;
 
 use serde::Deserialize;
+use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
@@ -60,7 +61,12 @@ const MAX_FILE_SIZE: u64 = 4 << 20;
 
 /// Reads a whole configuration file, refusing one larger than [`MAX_FILE_SIZE`].
 fn read_config_file(path: &Path) -> Result<String, String> {
-    let file = std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    read_opened_file(file, path)
+}
+
+/// Reads an opened file to its end, refusing more than [`MAX_FILE_SIZE`]; `path` labels errors.
+fn read_opened_file(file: File, path: &Path) -> Result<String, String> {
     let mut text = String::new();
     file.take(MAX_FILE_SIZE + 1)
         .read_to_string(&mut text)
