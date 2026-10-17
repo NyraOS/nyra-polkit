@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Format, lints and unit tests (on stable Rust and on 1.85, the oldest we support: Debian 13's),
-# licences and advisories of the locked dependencies, and a scan for secrets.
+# the D-Bus integration tests in Debian 13, licences and advisories of the locked dependencies, and
+# a scan for secrets.
 # Every push to any branch runs it once; pull_request runs only for pull requests from forks, whose
 # pushes do not run here. Weekly as well, so new advisories show up without a code change.
 name: ci
@@ -26,6 +27,23 @@ jobs:
       - run: cargo test --locked --workspace
       - run: rustup toolchain install 1.85 --profile minimal
       - run: cargo +1.85 test --locked --workspace
+
+  # nyra-polkitd on a private system-like bus, as root in Debian 13: its dbus-daemon gives
+  # ProcessFD, its pkcheck is a client, and its polkitd package creates the polkitd user the daemon
+  # runs as. Debian's own Rust (1.85) builds it.
+  integration:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      # debian:trixie, pinned by its multi-arch index digest.
+      image: debian:trixie@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: apt-get update -q && apt-get install -qy --no-install-recommends ca-certificates cargo rustc dbus-daemon polkitd
+      - run: cargo test --locked --test dbus -- --ignored
 
   deny:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
