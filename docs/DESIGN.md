@@ -58,7 +58,9 @@ identity is `(sa{sv})`: a kind and its details.
 
 The caller is always identified by the bus (`GetConnectionCredentials` on its unique name), never by
 what it says. Properties: `BackendName` = `nyra-polkit`, `BackendVersion`, `BackendFeatures` = 1
-(temporary authorizations). The `Changed` signal is sent after the rules are reread and when a
+(temporary authorizations; 0 until authentication agents are served, since no temporary
+authorization can be obtained before). `CheckAuthorization` returns one struct, `(bba{ss})`, not
+three values: polkit's client library expects the struct. The `Changed` signal is sent after the rules are reread and when a
 temporary authorization appears, expires or is revoked. Errors use the documented names
 (`org.freedesktop.PolicyKit1.Error.Failed`, `Cancelled`, `NotSupported`, `NotAuthorized`,
 `CancellationIdNotUnique`).
@@ -82,8 +84,8 @@ groups (from the user database, NSS) and a session state, or the check fails wit
   comes from the bus (`GetConnectionCredentials`: `UnixUserID`, fixed when the connection was made)
   and the process from its `ProcessFD`. A bus that gives no `ProcessFD` fails the check: Debian 13's
   dbus 1.16 gives one.
-- **`unix-process`** (`pid`: `u`, `start-time`: `t`; recent client libraries may also send `uid` and
-  a `pidfd`, `h`): with a pidfd, the process is the pidfd's, and `pid` must match it. Without one,
+- **`unix-process`** (`pid`: `u`, `start-time`: `t`; client libraries may also send `uid`, an `i`
+  that is -1 when unknown, and recent ones a `pidfd`, `h`): with a pidfd, the process is the pidfd's, and `pid` must match it. Without one,
   the daemon opens a pidfd for `pid`, then reads the start time from `/proc/<pid>/stat`: a different
   start time (or 0) means the PID was reused or never pinned, and the check fails. The user is the
   real uid from `/proc/<pid>/status`. When the subject carries a `uid` that differs from it, the
@@ -182,7 +184,8 @@ A rule holds when every condition it sets holds:
 
 Unknown keys, wrong types and malformed action ids are errors. **Any error in any rule file, or a
 rule file or directory that is not trusted, makes the daemon deny every request** until it is fixed
-(see "Logging"): skipping the broken
+(see "Logging"). The daemon keeps running and keeps its bus name, so clients get an answer, not a
+missing service; `systemctl reload` once the files are fixed restores normal answers. Skipping the broken
 file could drop a rule that denies something, and a typo such as `sesion = "active"` must never
 turn into a rule that matches every session.
 
@@ -326,6 +329,11 @@ with no capabilities, only `AF_UNIX` sockets, a read-only view of the system and
 sandboxing. It can still read other users' `/proc/<pid>/stat` and `status` and open their pidfds,
 which is all it needs. It never runs code from rules and never calls out to the network.
 
+The files that install it are in `dist/`: the systemd unit (`nyra-polkit.service`, with this
+sandboxing), the bus policy (only `polkitd` may own the name; anyone may call it), the bus
+activation file and the sysusers.d line for `polkitd`. A static user rather than `DynamicUser=`: the
+bus policy names the user, and the bus reads it before a dynamic user would exist.
+
 ## Logging
 
 To the journal, with sd-daemon priority prefixes:
@@ -350,9 +358,12 @@ Cookies are never logged.
   ownership and mode checks, the session state from logind's properties, and the decision:
   defaults per session, unknown actions, each condition, the most restrictive result winning in any
   file order.
-- **Integration tests** (CI, a Debian 13 container): a private `dbus-daemon` stands in for the
-  system bus (`DBUS_SYSTEM_BUS_ADDRESS`), `python-dbusmock`'s logind template provides sessions,
-  and `nyra-polkitd` runs with test action and rule directories. Clients: Debian's `pkcheck` and
+- **Integration tests** (CI, a Debian 13 container, as root; `cargo test --test dbus -- --ignored`):
+  a private `dbus-daemon` with the system bus's default policy and the bus policy from `dist/`
+  stands in for the system bus (`DBUS_SYSTEM_BUS_ADDRESS`), and `nyra-polkitd` runs as the
+  `polkitd` user with test action and rule directories. logind is a fake served by the test on the
+  same bus, so each test process can be given any session, no session, or a logind failure (a
+  generic mock cannot answer `GetSessionByPID` per PID). Clients: Debian's `pkcheck` and
   our `pkcheck` (same exit codes: 0, 1, 2, 3, 126, 127), `libpolkit-gobject-1` through GObject
   introspection (`CheckAuthorization`, `EnumerateActions`, temporary authorizations, cancellation),
   and a test agent on `libpolkit-agent-1` with the real `polkit-agent-helper-1` and a test user in
@@ -364,9 +375,11 @@ Cookies are never logged.
 
 ## Dependencies
 
-Few, and each justified in `Cargo.toml`: `roxmltree` (action XML), `serde` and `toml` (rules), and,
-with the D-Bus service, `zbus` (the bus). `cargo deny` checks their licences and advisories on every
-pull request.
+Few, and each justified in `Cargo.toml`: `roxmltree` (action XML), `serde` and `toml` (rules),
+`zbus` (the bus, with its own small async runtime, no tokio) and `nix` (user names and groups from
+NSS). `rustix` (pidfds), `async-signal` (SIGHUP), `async-channel` (cancellation) and `futures-lite`
+are used directly but come with zbus anyway. `cargo deny` checks their licences and advisories on
+every pull request.
 
 ## Sources
 
@@ -392,4 +405,6 @@ Read for this design; nothing from polkit's source code.
 - Observed: action files installed on Debian 13 by systemd and others (`<annotate>` values are the
   element text; `gettext-domain`); `GetConnectionCredentials` on Debian 13's dbus 1.16.2 returns
   `ProcessFD`; on Debian 13's systemd 257, each user's `manager` session has no seat, `Remote=no`
-  and `Active=yes`.
+  and `Active=yes`; Debian 13's `pkcheck` (polkit 126) sends a `unix-process` subject with `pid`
+  (`u`), `start-time` (`t`) and `uid` (`i`), no pidfd, and reads the result of `CheckAuthorization`
+  as one `(bba{ss})` struct.
