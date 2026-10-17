@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: MIT
+# D-Bus activation: /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service
+# The bus starts the systemd unit when a client first calls the authority.
+[D-BUS Service]
+Name=org.freedesktop.PolicyKit1
+Exec=/usr/libexec/nyra-polkitd
+User=polkitd
+SystemdService=nyra-polkit.service

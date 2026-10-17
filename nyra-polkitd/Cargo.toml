@@ -18,3 +18,19 @@ roxmltree = "0.21"
 serde = { version = "1", features = ["derive"] }
 # The TOML parser for the rule files; only parsing, no TOML writer.
 toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }
+# The D-Bus service and its calls to the bus and to logind. Pure Rust, no libdbus. Its own small
+# async runtime (async-io, the default) is all the daemon needs, so no tokio. 5.13 is the last
+# version that builds with Rust 1.85 (deny.toml says why that matters).
+zbus = { version = "5.13.2", default-features = false, features = ["async-io"] }
+# The rest is already in zbus's dependency tree; used directly, they add no crate:
+# - pidfd_open(2) and poll(2) on a pidfd, safely (no unsafe code here);
+rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "event"] }
+# - SIGHUP (`systemctl reload`) as an async stream, in the same runtime as the bus;
+async-signal = "0.2.14"
+# - what CancelCheckAuthorization uses to stop a check in flight;
+async-channel = "2.5.0"
+# - block_on for main and racing a check against its cancellation.
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+# A user's name and groups from the user database (NSS: getpwuid_r, getgrouplist), without unsafe
+# code here. Only its "user" feature.
+nix = { version = "0.31.3", default-features = false, features = ["user"] }

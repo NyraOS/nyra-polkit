@@ -5,6 +5,15 @@
 # Known vulnerabilities fail the build (the default); so do unmaintained and yanked crates.
 unmaintained = "all"
 yanked = "deny"
+# zbus 6 merged zvariant, zvariant_derive and zbus_names into itself, so their 5.x crates are now
+# flagged unmaintained. zbus 6 needs Rust 1.89; the daemon builds with Debian 13's Rust 1.85, so it
+# stays on zbus 5.13 until that changes. Only "unmaintained" notices are ignored, never a
+# vulnerability: a security advisory for any of these crates still fails the build.
+ignore = [
+    { id = "RUSTSEC-2026-0370", reason = "zvariant 5: merged into zbus 6, which needs Rust 1.89" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names 4: merged into zbus 6, which needs Rust 1.89" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive 5: merged into zbus 6, which needs Rust 1.89" },
+]
 
 [licenses]
 # Permissive licences only, so the daemon stays cleanly MIT. Unicode-3.0 covers unicode-ident (used
