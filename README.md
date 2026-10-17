@@ -7,6 +7,32 @@ libraries, desktop authentication agents (KDE's included) and system services su
 NetworkManager, udisks2 and Flatpak keep working unchanged. Local policy is written as simple TOML
 rules instead of JavaScript, and when several rules match, the most restrictive one wins.
 
+## Why
+
+polkit is the gatekeeper of a Linux desktop: whenever an application asks a system service to do
+something privileged (connect to a network, mount a disk, install an application, change the
+time, shut down), the service asks polkit whether this user, in this session, is allowed to.
+`polkitd` runs as root and its answer is the last line of defence for all of it, so a bug in it can
+hand administrator rights to anyone. polkit has had serious vulnerabilities of this kind (PwnKit,
+CVE-2021-4034, gave root to any local user).
+
+We wanted that piece to be as small and as easy to check as it can be:
+
+- **Memory safety.** Written in Rust, a whole class of bugs that C code is exposed to (buffer
+  overflows, use after free) is ruled out by the language.
+- **No JavaScript engine running as root.** `polkitd` embeds a JavaScript interpreter only to
+  evaluate its rules. nyra-polkit reads plain TOML rules instead: who, which actions, and the
+  answer.
+- **Rules you can read one at a time.** With polkit, the first matching JavaScript rule wins, in
+  file-name order, so a file added later can quietly change what an earlier one meant. Here the
+  most restrictive matching rule always wins, a `no` cannot be overridden, and a rules file with
+  any error makes every request fail closed instead of matching too much.
+- **Nothing else has to change.** The D-Bus interface is small, documented and stable for years, so
+  applications, authentication agents and the polkit client libraries keep working as they are.
+
+nyra-polkit is written for Nyra OS, but nothing in it is specific to Nyra; any distribution can use
+it.
+
 ## Status
 
 Early work. What exists today: the design ([`docs/DESIGN.md`](docs/DESIGN.md)) and `nyra-polkitd`,
