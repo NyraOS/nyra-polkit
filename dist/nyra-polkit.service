@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: MIT
+# /usr/lib/systemd/system/nyra-polkit.service
+[Unit]
+Description=Authorization manager (nyra-polkit)
+Documentation=https://github.com/NyraOS/nyra-polkit
+# No [Install]: the bus starts it on first use (org.freedesktop.PolicyKit1.service).
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.PolicyKit1
+ExecStart=/usr/libexec/nyra-polkitd
+# Rereads the action files and the rules; broken rules deny every check until the next reload.
+ExecReload=kill -HUP $MAINPID
+
+# A static system user, not DynamicUser=: the bus policy that lets it own the name refers to the
+# user by name, and the bus reads that policy before any dynamic user exists.
+User=polkitd
+Group=polkitd
+
+# No privileges at all: it only reads world-readable files, talks to the bus and opens pidfds.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+
+# A read-only view of the system, nothing of the users' files.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+UMask=0077
+RemoveIPC=yes
+# Must see every process: the subjects are other users' processes (their stat, status and cgroup).
+# So no ProtectProc=invisible, and no PrivateUsers=, which would show their uids as nobody.
+ProcSubset=pid
+
+# Only the bus and NSS (userdb) sockets; no network.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
