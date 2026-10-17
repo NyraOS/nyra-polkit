@@ -327,7 +327,7 @@ Threat model:
 | a remote user (SSH) | use their processes left in another user's local session (`su`, `sudo -u` at the seat) | a session of another user is not local, except for root |
 | a local user | write rules | rule files and directories must be root's and not writable by others |
 | a sandboxed app | act as more than its user | it is identified like any other client of the system bus, by the bus |
-| anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user; calls to logind time out (10 s); `MemoryMax=` and `TasksMax=` in the unit; size limits on files; no recursion on input |
+| anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user other than root; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
 | a broken or hostile action file | crash or bloat the daemon | parse errors skip the file (its actions stay unknown, so denied); no external DTD or entity loading; node and size limits |
 | an administrator's typo | open more than meant | unknown keys are errors, and any error denies everything |
 
@@ -349,8 +349,22 @@ which is all it needs. It never runs code from rules and never calls out to the 
 every check may wait on logind, while the bus limits the replies the daemon itself may be waiting
 for (128 by default). So besides the 32 checks per connection, one user (the callers' uid) has at
 most 64 checks in flight over all their connections, and no user alone can fill the daemon's
-replies. Reads of `/proc` and of the user database (NSS, which may be LDAP or SSSD) run as blocking
-tasks, off the bus executor, so a slow lookup holds only its own check.
+replies. Root is not counted: root's callers are the system services (logind, NetworkManager,
+udisks2...), and a user can make them ask on the user's behalf, so one pool shared by all of them
+would let one user use it up and make every service's checks fail for everyone. Each service
+connection keeps its limit of 32, and users cannot open connections as root. Reads of `/proc` and
+of the user database (NSS, which may be LDAP or SSSD) run as blocking tasks, off the bus executor,
+so a slow lookup holds only its own check.
+
+**No memory limit in the unit.** The bus accepts messages up to 32 MiB, and zbus turns a call's
+arguments into Rust values before the daemon sees the call or its size, so one `CheckAuthorization`
+from any user with 32 MiB of small details takes the daemon to about 250 MB for a moment. A
+`MemoryMax=` below that lets any user have the daemon killed (OOM) with one call; repeated, the
+kills hit systemd's start limit and every check then fails for everyone. `MemoryHigh=` only slows
+the daemon until it stops answering. So the unit sets no memory limit: memory is bounded by the
+bus's limits (message size, connections per user) and the checks in flight. An integration test
+sends such a call to the daemon in a cgroup with the unit's memory settings and no swap, and checks
+that the same daemon still answers.
 
 The files that install it are in `dist/`: the systemd unit (`nyra-polkit.service`, with this
 sandboxing), the bus policy (only `polkitd` may own the name; anyone may call it), the bus

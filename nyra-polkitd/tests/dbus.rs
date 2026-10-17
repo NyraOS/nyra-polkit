@@ -1329,9 +1329,9 @@ fn two_cancellable_checks_from_one_caller() {
 
 #[test]
 #[ignore = "needs root and dbus-daemon: run by the integration job"]
-fn checks_in_flight_are_limited_per_connection_and_per_user() {
+fn the_limit_per_connection_holds_and_root_has_no_limit_per_user() {
     futures_lite::future::block_on(async {
-        let bus = Harness::start("limits", "").await;
+        let bus = Harness::start("limits-root", "").await;
         bus.add_session("c1", LOCAL_ACTIVE).await;
         bus.place(me(), ByPid::Session("c1"));
         let slow = Sleeper::start(None);
@@ -1358,22 +1358,157 @@ fn checks_in_flight_are_limited_per_connection_and_per_user() {
             .map(|_| ())
             .map_err(error_name);
         assert_eq!(on_first, Err(FAILED.to_string()));
-        // Another connection of the same user (root) has its own 32...
+        // Another connection has its own 32.
         let second = connect(&bus.address).await;
         for _ in 0..32 {
             send_check(&second, &slow_subject).await;
         }
         arrivals(&at_logind, 32).await;
-        // ...but the user has 64 in all: a third connection is refused too.
+        // Root's connections are the system services': 64 checks of root in flight do not stop a
+        // third one.
+        assert_eq!(bus.check(&me_subject, DEFAULT).await, Ok(YES));
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn a_user_has_at_most_64_checks_in_flight() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("limits-user", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.place(me(), ByPid::Session("c1"));
+        let slow = Sleeper::start(Some("nobody"));
+        let (arrived, at_logind) = async_channel::bounded(1);
+        bus.place(slow.pid(), ByPid::Hang(arrived));
+        let slow_pid = slow.pid().to_string();
+        let pkcheck_slow = ["--action-id", DEFAULT, "--process", &slow_pid];
+
+        // 64 checks of nobody wait on logind, each from its own pkcheck (its own connection).
+        let mut waiting: Vec<Child> = (0..64)
+            .map(|_| {
+                Command::new("setpriv")
+                    .args(["--reuid=nobody", "--regid=nogroup", "--clear-groups", "--"])
+                    .arg("pkcheck")
+                    .args(pkcheck_slow)
+                    .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        arrivals(&at_logind, 64).await;
+        // A 65th, from yet another connection, is refused at once.
         assert_eq!(
-            bus.check(&me_subject, DEFAULT).await,
+            bus.pkcheck_as(Some("nobody"), &pkcheck_slow),
             Err(FAILED.to_string())
         );
-        // Other users are not: nobody checks itself (no session: allow_any, "no").
-        let itself = format!("exec pkcheck --action-id {DEFAULT} --process $$");
-        assert_eq!(
-            pkcheck_answer(bus.run(Some("nobody"), "sh", &["-c", &itself])),
-            Ok(PKCHECK_NOT_AUTHORIZED)
-        );
+        // Other users are not affected.
+        assert_eq!(bus.check(&unix_process(me()), DEFAULT).await, Ok(YES));
+        for pkcheck in &mut waiting {
+            let _ = pkcheck.kill();
+            let _ = pkcheck.wait();
+        }
+    });
+}
+
+/// The daemon's process in a cgroup with the memory settings of the unit in `dist/`: its
+/// `MemoryMax=` (none: no limit) and no swap, as on a machine without swap. The memory controller
+/// is only given to the children of a cgroup without processes, so the container's processes move
+/// to a child cgroup first; dropping this takes the controller back and moves them back, leaving
+/// the container's cgroups as they were.
+struct UnitMemoryCgroup {
+    others: PathBuf,
+    daemon: PathBuf,
+}
+
+/// Moves every process of the cgroup `from` to `to` until `done` (processes may start meanwhile);
+/// false if it never is. Does not panic: it also runs while a failed test unwinds.
+fn move_processes(from: &Path, to: &Path, done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        let processes = std::fs::read_to_string(from.join("cgroup.procs")).unwrap_or_default();
+        for process in processes.lines() {
+            let _ = std::fs::write(to.join("cgroup.procs"), process);
+        }
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+impl UnitMemoryCgroup {
+    fn place(pid: u32) -> Self {
+        let root = Path::new(CGROUP_ROOT);
+        let others = root.join("nyra-polkit-tests");
+        std::fs::create_dir_all(&others).expect("a writable /sys/fs/cgroup (see the top)");
+        let emptied = move_processes(root, &others, || {
+            std::fs::write(root.join("cgroup.subtree_control"), "+memory").is_ok()
+        });
+        assert!(emptied, "the memory controller for the daemon's cgroup");
+
+        let unit = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist/nyra-polkit.service"),
+        )
+        .unwrap();
+        let memory_max = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("MemoryMax="))
+            .unwrap_or("max");
+        let daemon = root.join("nyra-polkitd");
+        std::fs::create_dir_all(&daemon).unwrap();
+        std::fs::write(daemon.join("memory.max"), memory_max).unwrap();
+        std::fs::write(daemon.join("memory.swap.max"), "0").unwrap();
+        std::fs::write(daemon.join("cgroup.procs"), pid.to_string()).unwrap();
+        Self { others, daemon }
+    }
+
+    /// The most memory the daemon has used.
+    fn peak(&self) -> String {
+        std::fs::read_to_string(self.daemon.join("memory.peak")).unwrap_or_default()
+    }
+}
+
+impl Drop for UnitMemoryCgroup {
+    fn drop(&mut self) {
+        let root = Path::new(CGROUP_ROOT);
+        let _ = std::fs::write(root.join("cgroup.subtree_control"), "-memory");
+        move_processes(&self.daemon, root, || {
+            std::fs::remove_dir(&self.daemon).is_ok()
+        });
+        move_processes(&self.others, root, || {
+            std::fs::remove_dir(&self.others).is_ok()
+        });
+    }
+}
+
+#[test]
+#[ignore = "needs root, dbus-daemon and a writable /sys/fs/cgroup: run by the integration job"]
+fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
+    futures_lite::future::block_on(async {
+        let mut bus = Harness::start("large-call", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.place(me(), ByPid::Session("c1"));
+        let cgroup = UnitMemoryCgroup::place(bus.daemon.id());
+        let subject = unix_process(me());
+
+        // About 31 MiB of details (24 bytes each on the wire), under the bus's 32 MiB per message:
+        // turned into Rust values, they take far more.
+        let names: Vec<String> = (0..1_350_000).map(|i| format!("{i:x}")).collect();
+        let details: HashMap<&str, &str> = names.iter().map(|name| (name.as_str(), "")).collect();
+        let large = bus.check_with(&subject, DEFAULT, details, 0, "").await;
+        eprintln!("the daemon's peak memory: {} bytes", cgroup.peak().trim());
+        assert_eq!(large.map(|(authorized, _, _)| authorized), Ok(true));
+        // The same daemon still answers.
+        assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
+        assert!(bus.daemon.try_wait().unwrap().is_none(), "{}", bus.log());
+
+        drop(bus);
+        drop(cgroup);
     });
 }

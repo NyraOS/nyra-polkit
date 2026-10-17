@@ -29,9 +29,10 @@ pub const AUTHORITY_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
 const ALLOW_USER_INTERACTION: u32 = 1;
 /// Checks one connection may have in flight (docs/DESIGN.md, "Security").
 const MAX_CHECKS_PER_CONNECTION: usize = 32;
-/// Checks one user may have in flight over all their connections. A user may open many connections,
-/// and every check may wait on logind, while the bus limits the replies the daemon can wait for
-/// (128 by default): one user alone must not fill them and lock out everyone else.
+/// Checks one user other than root may have in flight over all their connections. A user may open
+/// many connections, and every check may wait on logind, while the bus limits the replies the
+/// daemon can wait for (128 by default): one user alone must not fill them and lock out everyone
+/// else. Root is not counted: see [`ChecksInFlight::begin_for_user`].
 const MAX_CHECKS_PER_USER: usize = 64;
 /// What a caller is told when its subject cannot be identified. The reason goes to the journal
 /// only: it may name another user's process or uid.
@@ -192,7 +193,15 @@ impl ChecksInFlight {
     }
 
     /// Counts a check of user `uid`, once the caller's uid is known (after [`Self::begin`]).
+    ///
+    /// Root's checks are not counted: root's callers are the system services (logind,
+    /// NetworkManager, udisks2...), which a user can make ask on their behalf. One pool for all of
+    /// them would let one user use it up for everyone. Each of their connections keeps its own
+    /// limit, and users cannot open connections as root.
     fn begin_for_user(&mut self, uid: u32) -> Result<(), Error> {
+        if uid == 0 {
+            return Ok(());
+        }
         let count = self.by_user.entry(uid).or_default();
         if *count >= MAX_CHECKS_PER_USER {
             return Err(Error::Failed(format!(
@@ -306,7 +315,7 @@ impl Authority {
         caller: &str,
         (kind, subject_details): (String, HashMap<String, OwnedValue>),
         action_id: &str,
-        details: &HashMap<String, String>,
+        details: HashMap<String, String>,
     ) -> Result<AuthorizationResult, Error> {
         let caller_uid = subject::bus_uid(connection, caller)
             .await
@@ -319,7 +328,7 @@ impl Authority {
             checks: &self.checks,
             uid: caller_uid,
         };
-        check_details(details, caller_uid)?;
+        check_details(&details, caller_uid)?;
 
         let not_identified = |error: String| {
             eprintln!("<4>check of {action_id} from {caller}: {SUBJECT_NOT_IDENTIFIED}: {error}");
@@ -354,7 +363,7 @@ impl Authority {
                 return Ok(answer(Authorization::No));
             }
         };
-        let details: std::collections::BTreeMap<_, _> = details.clone().into_iter().collect();
+        let details: std::collections::BTreeMap<_, _> = details.into_iter().collect();
         let subject = Subject {
             user,
             groups,
@@ -491,7 +500,7 @@ impl Authority {
             caller: caller.clone(),
             cancellation_id: cancellation_id.clone(),
         };
-        let check = self.check(connection, &caller, subject, &action_id, &details);
+        let check = self.check(connection, &caller, subject, &action_id, details);
         let cancellation = async {
             match cancelled {
                 Some(cancelled) => {
@@ -622,8 +631,11 @@ mod tests {
             assert!(checks.begin_for_user(1000).is_ok());
         }
         assert!(matches!(checks.begin_for_user(1000), Err(Error::Failed(_))));
-        // Other users have their own limit.
+        // Other users have their own limit; root has none.
         assert!(checks.begin_for_user(1001).is_ok());
+        for _ in 0..100 {
+            assert!(checks.begin_for_user(0).is_ok());
+        }
         checks.end_for_user(1000);
         assert!(checks.begin_for_user(1000).is_ok());
         for _ in 0..64 {

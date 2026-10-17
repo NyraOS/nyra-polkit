@@ -31,10 +31,9 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 
-# Bounds on what a flood of checks can take, besides the limits on checks in flight; the daemon
-# itself needs a few MiB and a few threads. Past them a thread is refused or the daemon is stopped:
-# the checks in flight then fail, never succeed, and the bus starts it again on the next call.
-MemoryMax=128M
+# Threads, besides the limits on checks in flight: the daemon needs a few; past the bound a thread
+# is refused and the work waits for one already running. No MemoryMax=: one call from any user may
+# need about 250 MB for a moment (docs/DESIGN.md, "Limits"), and an OOM kill would stop every check.
 TasksMax=64
 
 # A read-only view of the system, nothing of the users' files.
