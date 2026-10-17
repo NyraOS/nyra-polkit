@@ -162,7 +162,8 @@ All other files apply together; their order does not matter.
 **Only root can write rules.** Both directories and every rule file must be owned by root and not
 writable by group or others, and every rule file must be a regular file. Files are checked on the
 opened file (fstat), so a symbolic link is judged by its target and a link to `/dev/null` is not a
-rule file. Anything else is a rule error, as sudo does for sudoers.
+rule file. Anything else is a rule error, as sudo does for sudoers. So is a file name that is not
+UTF-8; names starting with `.` (editor leftovers such as `.#50-local.toml`) are ignored.
 
 A file may have an `[administrators]` table (`users`, `groups`) and any number of `[[rule]]`
 tables. The administrators of all files add up; without any, root is the administrator.

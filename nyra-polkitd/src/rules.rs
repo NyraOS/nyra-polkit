@@ -207,8 +207,12 @@ fn rule_files(directory: &Path, owner: u32) -> Result<Vec<(String, PathBuf)>, St
     let mut files = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".toml") {
+        // A name that is not UTF-8 could collide with another one once made readable; refuse it.
+        let Ok(name) = entry.file_name().into_string() else {
+            return Err(format!("{}: a file name is not UTF-8", directory.display()));
+        };
+        // Hidden files are editors' leftovers, such as Emacs locks (.#50-local.toml).
+        if name.ends_with(".toml") && !name.starts_with('.') {
             files.push((name, entry.path()));
         }
     }
@@ -313,6 +317,10 @@ mod tests {
                 "only allowed with result = \"no\"",
             ),
             ("administrators = { group = [\"sudo\"] }", "unknown field"),
+            (
+                "[[rules]]\nactions = [\"a\"]\nresult = \"no\"",
+                "unknown field",
+            ),
             ("administrators = { groups = [\"\"] }", "empty name"),
             (
                 "[rule]\nactions = [\"a\"]\nresult = \"yes\"",
@@ -473,6 +481,31 @@ mod tests {
 
         std::fs::remove_dir_all(&directory).unwrap();
         std::fs::remove_dir_all(&target).unwrap();
+    }
+
+    #[test]
+    fn hidden_files_are_ignored_and_names_must_be_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+        let (directory, owner) = temporary_directory("names");
+        let missing = directory.join("none");
+        write(
+            directory.join("50-a.toml"),
+            "[[rule]]\nactions = [\"a\"]\nresult = \"no\"\n",
+        );
+        write(directory.join(".#50-a.toml"), "not toml at all");
+        let (rules, notes) = load_rules_owned_by(&directory, &missing, owner).unwrap();
+        assert_eq!(rules.rules.len(), 1);
+        assert_eq!(
+            notes,
+            [format!("read {}", directory.join("50-a.toml").display())]
+        );
+
+        let not_utf8 = std::ffi::OsStr::from_bytes(b"50-\xff.toml");
+        write(directory.join(not_utf8), "");
+        let error = load_rules_owned_by(&directory, &missing, owner).unwrap_err();
+        assert!(error.contains("not UTF-8"), "{error}");
+
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
