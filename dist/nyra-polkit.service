@@ -31,6 +31,12 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 
+# Bounds on what a flood of checks can take, besides the limits on checks in flight; the daemon
+# itself needs a few MiB and a few threads. Past them a thread is refused or the daemon is stopped:
+# the checks in flight then fail, never succeed, and the bus starts it again on the next call.
+MemoryMax=128M
+TasksMax=64
+
 # A read-only view of the system, nothing of the users' files.
 ProtectSystem=strict
 ProtectHome=yes

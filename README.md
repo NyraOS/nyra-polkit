@@ -56,9 +56,9 @@ cargo build --release
 cargo test
 ```
 
-The D-Bus integration tests run nyra-polkitd on a private bus and need root, `dbus-daemon`,
-`pkcheck` and the `polkitd` user (Debian 13: the `dbus-daemon` and `polkitd` packages); CI runs them
-in a Debian 13 container:
+The D-Bus integration tests run nyra-polkitd on a private bus and need root, a writable
+`/sys/fs/cgroup`, `dbus-daemon`, `pkcheck`, `busctl` and the `polkitd` user (Debian 13: the
+`dbus-daemon`, `polkitd` and `systemd` packages); CI runs them in a privileged Debian 13 container:
 
 ```sh
 cargo test --test dbus -- --ignored

@@ -10,6 +10,12 @@ use nyra_polkitd::authority::{AUTHORITY_PATH, Authority, BUS_NAME, Directories, 
 use nyra_polkitd::rules::{IMAGE_RULES_DIR, LOCAL_RULES_DIR};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
+
+/// How long a call to logind or to the bus may take; a check whose call times out is refused. Well
+/// under the 25 s that D-Bus clients usually wait, so they get the refusal rather than their own
+/// timeout. zbus has no timeout of its own: without this, a stuck logind would hold every check.
+const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 const USAGE: &str =
     "usage: nyra-polkitd [--actions-dir DIR] [--image-rules-dir DIR] [--local-rules-dir DIR]";
@@ -62,6 +68,7 @@ async fn serve(directories: Directories) -> Result<(), String> {
     // reload reads valid rules, so clients get an answer, never a missing service.
     let authority = Authority::new(load_policy(&directories));
     let connection = zbus::connection::Builder::system()
+        .map(|builder| builder.method_timeout(CALL_TIMEOUT))
         .and_then(|builder| builder.serve_at(AUTHORITY_PATH, authority))
         .and_then(|builder| builder.name(BUS_NAME))
         .map_err(|error| error.to_string())?
