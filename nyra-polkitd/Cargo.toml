@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "nyra-polkitd"
+version = "0.1.0"
+edition = "2024"
+# The Rust in Debian 13 (trixie), so the daemon also builds with the distribution's compiler.
+rust-version = "1.85"
+license = "MIT"
+publish = false
+description = "A polkit authority daemon with TOML rules, written from scratch"
+
+# Every dependency is a choice (docs/DESIGN.md, "Dependencies"); prefer none.
+[dependencies]
+# Reads the action definitions (polkit .policy XML): a small read-only tree, no dependencies of
+# its own, never fetches external DTDs or entities.
+roxmltree = "0.21"
+# Reads the rule files into plain structs (derive), with unknown fields refused.
+serde = { version = "1", features = ["derive"] }
+# The TOML parser for the rule files; only parsing, no TOML writer.
+toml = { version = "1", default-features = false, features = ["std", "parse", "serde"] }

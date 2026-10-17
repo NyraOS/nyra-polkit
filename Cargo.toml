@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+[workspace]
+members = ["nyra-polkitd"]
+resolver = "3"
