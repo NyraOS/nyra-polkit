@@ -13,8 +13,8 @@ use std::path::Path;
 /// The directory polkit(8) installs action files in.
 pub const ACTIONS_DIR: &str = "/usr/share/polkit-1/actions";
 
-/// Entity declarations can blow a small file up into a huge tree; real files have a few thousand
-/// nodes, so this only stops such a bomb.
+/// Real files have a few thousand nodes; the limit stops a file with a huge number of elements
+/// (roxmltree itself stops entity bombs).
 const MAX_XML_NODES: u32 = 200_000;
 
 /// All known actions, by id.
@@ -324,6 +324,13 @@ mod tests {
     }
 
     #[test]
+    fn stops_huge_element_counts() {
+        let xml = format!("<policyconfig>{}</policyconfig>", "<x/>".repeat(250_000));
+        let error = parse_policy(&xml).unwrap_err();
+        assert!(error.contains("nodes limit reached"), "{error}");
+    }
+
+    #[test]
     fn stops_entity_bombs() {
         let mut xml = String::from("<!DOCTYPE policyconfig [<!ENTITY a0 \"x\">");
         for level in 1..12 {
@@ -345,14 +352,17 @@ mod tests {
         // Defines org.example.disk.mount a second time.
         let again = r#"<policyconfig><action id="org.example.disk.mount"/></policyconfig>"#;
         std::fs::write(directory.join("c.policy"), again).unwrap();
+        // And a third time: still unknown, not defined again.
+        std::fs::write(directory.join("c2.policy"), again).unwrap();
         std::fs::write(directory.join("d.policy"), "<policyconfig>").unwrap();
         std::fs::write(directory.join("e.txt"), "ignored").unwrap();
         let (actions, problems) = load_actions(&directory);
         std::fs::remove_dir_all(&directory).unwrap();
         let ids: Vec<_> = actions.keys().collect();
         assert_eq!(ids, ["org.example.disk.check", "org.example.other"]);
-        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert_eq!(problems.len(), 3, "{problems:?}");
         assert!(problems[0].contains("c.policy") && problems[0].contains("more than once"));
-        assert!(problems[1].contains("d.policy") && problems[1].contains("denied"));
+        assert!(problems[1].contains("c2.policy") && problems[1].contains("more than once"));
+        assert!(problems[2].contains("d.policy") && problems[2].contains("denied"));
     }
 }

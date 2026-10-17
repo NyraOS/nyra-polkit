@@ -281,6 +281,64 @@ mod tests {
         }
     }
 
+    /// Each pair of results, in both file orders: the more restrictive one wins. This pins the
+    /// whole order, not just its ends.
+    #[test]
+    fn results_are_ordered_from_yes_to_no() {
+        let order = [
+            "yes",
+            "auth_self_keep",
+            "auth_self",
+            "auth_admin_keep",
+            "auth_admin",
+            "no",
+        ];
+        let alice = subject("alice", &[], Session::LocalActive);
+        let rule = |result: &str| {
+            format!("[[rule]]\nactions = [\"org.example.mount\"]\nresult = \"{result}\"\n")
+        };
+        for (lower, weaker) in order.iter().enumerate() {
+            for stronger in &order[lower + 1..] {
+                let expected = Authorization::parse(stronger).unwrap();
+                for text in [
+                    rule(weaker) + &rule(stronger),
+                    rule(stronger) + &rule(weaker),
+                ] {
+                    let rules = rules(&text);
+                    let result = decide(
+                        &actions(),
+                        &rules,
+                        "org.example.mount",
+                        &alice,
+                        &no_details(),
+                    );
+                    assert_eq!(result, expected, "{weaker} and {stronger}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_local_means_a_local_session_active_or_not() {
+        let rules = rules(
+            "[[rule]]\nactions = [\"org.example.reboot\"]\nsession = \"local\"\nresult = \"yes\"\n",
+        );
+        let reboot = |session| {
+            let alice = subject("alice", &[], session);
+            decide(
+                &actions(),
+                &rules,
+                "org.example.reboot",
+                &alice,
+                &no_details(),
+            )
+        };
+        assert_eq!(reboot(Session::LocalActive), Yes);
+        assert_eq!(reboot(Session::LocalInactive), Yes);
+        // Not local: the rule does not match, the default (allow_any) applies.
+        assert_eq!(reboot(Session::NotLocal), AuthAdmin);
+    }
+
     #[test]
     fn a_rule_can_also_ask_for_more_than_the_default() {
         let rules = rules("[[rule]]\nactions = [\"org.example.mount\"]\nresult = \"auth_admin\"\n");

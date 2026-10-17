@@ -87,3 +87,19 @@ pub fn is_valid_action_id(id: &str) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refuses_files_over_the_size_limit() {
+        let path = std::env::temp_dir().join(format!("nyra-polkit-size-{}", std::process::id()));
+        std::fs::write(&path, vec![b' '; MAX_FILE_SIZE as usize]).unwrap();
+        assert!(read_config_file(&path).is_ok());
+        std::fs::write(&path, vec![b' '; MAX_FILE_SIZE as usize + 1]).unwrap();
+        let error = read_config_file(&path).unwrap_err();
+        std::fs::remove_file(&path).unwrap();
+        assert!(error.contains("larger than"), "{error}");
+    }
+}
