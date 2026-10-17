@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: MIT
+# Updates for the GitHub Actions pinned by SHA and for the locked Rust crates: pins keep CI from
+# running code nobody reviewed, and Dependabot keeps them current. Minor and patch updates come
+# grouped in one pull request each.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      minor-and-patch:
+        update-types: [minor, patch]

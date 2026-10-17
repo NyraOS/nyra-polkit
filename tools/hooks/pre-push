@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Refuse direct pushes to main (CONTRIBUTING.md). Work goes through a branch and a pull request.
+# An accident guard, not a security boundary: GitHub's branch protection on main is the boundary for
+# direct pushes, this refuses the push before it leaves the machine. NYRA_ALLOW_MAIN=1 skips the check.
+while read -r _ _ remote_ref _; do
+  if [ "$remote_ref" = "refs/heads/main" ] && [ "${NYRA_ALLOW_MAIN:-0}" != "1" ]; then
+    echo "pre-push: direct push to main refused. Push a branch and open a pull request (CONTRIBUTING.md)." >&2
+    exit 1
+  fi
+done
+exit 0
