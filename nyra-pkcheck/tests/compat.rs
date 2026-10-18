@@ -458,18 +458,35 @@ fn the_same_answers_as_debians_pkcheck() {
     with_details.extend(["--detail", "k", "v", "-d", "føl,你好", "x"].map(String::from));
     same_as_root(&with_details, 0, Same);
 
-    // Not authorized: a rule says no, the default says no, or the action is unknown.
-    same_as_root(&check(DENIED, &pid), 1, Same);
-    same_as_root(&check(DEFAULT, &full), 1, Same);
-    same_as_root(&check(UNKNOWN, &pid), 1, Same);
+    // Root is authorized for everything: whatever a rule or the default says, even for an
+    // unknown action.
+    same_as_root(&check(DENIED, &pid), 0, Same);
+    same_as_root(&check(DEFAULT, &full), 0, Same);
+    same_as_root(&check(UNKNOWN, &pid), 0, Same);
+    same_as_root(&check(CHALLENGE, &pid), 0, Same);
+
+    // Not authorized, for nobody's own process (no session): a rule says no, the default says no,
+    // or the action is unknown.
+    let nobody_full = nobody.full(NOBODY);
+    let as_nobody = |args: &[&str], code: i32, stderr: Stderr| {
+        same(&bus, Some("nobody"), None, args, code, stderr);
+    };
+    as_nobody(&["-a", DENIED, "-p", &nobody_full], 1, Same);
+    as_nobody(&["-a", DEFAULT, "-p", &nobody_full], 1, Same);
+    as_nobody(&["-a", UNKNOWN, "-p", &nobody_full], 1, Same);
 
     // A password is needed: without -u, with -u and no agent; an internal agent cannot be made.
-    same_as_root(&check(CHALLENGE, &pid), 2, Same);
-    let mut interactive = check(CHALLENGE, &pid);
-    interactive.push("--allow-user-interaction".to_string());
-    same_as_root(&interactive, 2, Same);
-    interactive.push("--enable-internal-agent".to_string());
-    same_as_root(&interactive, 126, Differs);
+    as_nobody(&["-a", CHALLENGE, "-p", &nobody_full], 2, Same);
+    let mut interactive = vec![
+        "-a",
+        CHALLENGE,
+        "-p",
+        &nobody_full,
+        "--allow-user-interaction",
+    ];
+    as_nobody(&interactive, 2, Same);
+    interactive.push("--enable-internal-agent");
+    as_nobody(&interactive, 126, Differs);
     // An internal agent is only made when one is needed.
     let mut internal = check(RULED, &pid);
     internal.extend(["-u", "--enable-internal-agent"].map(String::from));

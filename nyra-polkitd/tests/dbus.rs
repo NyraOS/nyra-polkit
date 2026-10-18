@@ -134,7 +134,7 @@ users = ["nobody", "bin"]
 
 [[rule]]
 actions = ["org.nyra.test.ruled"]
-users = ["root"]
+users = ["nobody"]
 result = "yes"
 
 [[rule]]
@@ -843,11 +843,11 @@ async fn arrivals(at_logind: &async_channel::Receiver<()>, count: usize) {
 fn answers_from_rules_and_defaults_for_every_subject_kind() {
     futures_lite::future::block_on(async {
         let bus = Harness::start("answers", "").await;
-        bus.add_session("c1", LOCAL_ACTIVE).await;
-        bus.place(me(), ByPid::Session("c1"));
-        let own_name = bus.client.unique_name().unwrap().to_string();
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let nobody = Sleeper::start(Some("nobody"));
+        bus.place(nobody.pid(), ByPid::Session("c2"));
 
-        for subject in [unix_process(me()), bus_name(&own_name), unix_session("c1")] {
+        for subject in [unix_process(nobody.pid()), unix_session("c2")] {
             assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES), "{subject:?}");
             assert_eq!(bus.check(&subject, RULED).await, Ok(YES), "{subject:?}");
             assert_eq!(bus.check(&subject, DENIED).await, Ok(NO), "{subject:?}");
@@ -859,7 +859,7 @@ fn answers_from_rules_and_defaults_for_every_subject_kind() {
             assert_eq!(bus.check(&subject, UNKNOWN).await, Ok(NO), "{subject:?}");
         }
 
-        let pid = me().to_string();
+        let pid = nobody.pid().to_string();
         assert_eq!(bus.pkcheck(DEFAULT, &pid), Ok(PKCHECK_AUTHORIZED));
         assert_eq!(bus.pkcheck(RULED, &pid), Ok(PKCHECK_AUTHORIZED));
         assert_eq!(bus.pkcheck(DENIED, &pid), Ok(PKCHECK_NOT_AUTHORIZED));
@@ -870,30 +870,68 @@ fn answers_from_rules_and_defaults_for_every_subject_kind() {
 
 #[test]
 #[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn root_is_authorized_for_every_action() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("root-authorized", "").await;
+        // No session for root's processes: the default is allow_any, "no" for DEFAULT.
+        let root = Sleeper::start(None);
+        let own_name = bus.client.unique_name().unwrap().to_string();
+
+        for subject in [unix_process(root.pid()), bus_name(&own_name)] {
+            // A default of "no", a rule that says "no", a challenge and an unknown action.
+            for action in [DEFAULT, DENIED, CHALLENGE, UNKNOWN] {
+                assert_eq!(bus.check(&subject, action).await, Ok(YES), "{subject:?}");
+            }
+        }
+        let pid = root.pid().to_string();
+        for action in [DEFAULT, DENIED, CHALLENGE, UNKNOWN] {
+            assert_eq!(bus.pkcheck(action, &pid), Ok(PKCHECK_AUTHORIZED));
+        }
+
+        // Even with rules that cannot be read.
+        let mut changes = changed_signals(&bus).await;
+        write_trusted(&bus.directory.join("local/90-local.toml"), BROKEN_RULES);
+        bus.reload();
+        within("Changed", changes.next()).await.unwrap().unwrap();
+        let subject = unix_process(root.pid());
+        assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
+
+        // Only uid 0: nobody's process is still denied.
+        let nobody = Sleeper::start(Some("nobody"));
+        assert_eq!(
+            bus.check(&unix_process(nobody.pid()), DEFAULT).await,
+            Ok(NO)
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
 fn the_session_from_logind_picks_the_default() {
     futures_lite::future::block_on(async {
         let bus = Harness::start("sessions", "").await;
         let session = |remote, seat, active| FakeSession {
-            uid: 0,
+            uid: NOBODY,
             remote,
             seat,
             active,
         };
-        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.add_session("c1", NOBODY_ACTIVE).await;
         bus.add_session("remote", session(true, "seat0", true))
             .await;
         // Like each user's manager session: no seat, not remote, active.
         bus.add_session("manager", session(false, "", true)).await;
         bus.add_session("inactive", session(false, "seat0", false))
             .await;
-        // root's display session is c1, but a process outside root's user manager does not get it.
-        bus.add_user_with_display(0, "c1").await;
+        // nobody's display session is c1, but a process outside nobody's user manager does not
+        // get it.
+        bus.add_user_with_display(NOBODY, "c1").await;
 
-        let no_session = Sleeper::start(None);
-        let remote = Sleeper::start(None);
-        let manager = Sleeper::start(None);
-        let inactive = Sleeper::start(None);
-        let failing = Sleeper::start(None);
+        let no_session = Sleeper::start(Some("nobody"));
+        let remote = Sleeper::start(Some("nobody"));
+        let manager = Sleeper::start(Some("nobody"));
+        let inactive = Sleeper::start(Some("nobody"));
+        let failing = Sleeper::start(Some("nobody"));
         bus.place(remote.pid(), ByPid::Session("remote"));
         bus.place(manager.pid(), ByPid::Session("manager"));
         bus.place(inactive.pid(), ByPid::Session("inactive"));
@@ -1165,10 +1203,10 @@ fn other_users_subjects_and_polkit_details() {
         let nobody = Sleeper::start(Some("nobody"));
         bus.place(nobody.pid(), ByPid::Session("c2"));
 
-        // root may check anyone; the answer is the subject's own: the rule for root does not apply.
+        // root may check anyone; the answer is the subject's own: the rule for nobody applies.
         let subject = unix_process(nobody.pid());
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
-        assert_eq!(bus.check(&subject, RULED).await, Ok(NO));
+        assert_eq!(bus.check(&subject, RULED).await, Ok(YES));
 
         // Another user may not check root's subjects: a process, a bus name or a session.
         let refused = Err(NOT_AUTHORIZED.to_string());
@@ -1272,16 +1310,17 @@ fn the_owner_annotation_lets_a_user_check_others() {
 fn broken_rules_deny_everything_until_a_reload_fixes_them() {
     futures_lite::future::block_on(async {
         let bus = Harness::start("broken", BROKEN_RULES).await;
-        bus.add_session("c1", LOCAL_ACTIVE).await;
-        bus.place(me(), ByPid::Session("c1"));
-        let subject = unix_process(me());
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let nobody = Sleeper::start(Some("nobody"));
+        bus.place(nobody.pid(), ByPid::Session("c2"));
+        let subject = unix_process(nobody.pid());
 
         // The daemon keeps the name and denies everything, even what the defaults allow.
         for _ in 0..3 {
             assert_eq!(bus.check(&subject, DEFAULT).await, Ok(NO));
         }
         assert_eq!(
-            bus.pkcheck(DEFAULT, &me().to_string()),
+            bus.pkcheck(DEFAULT, &nobody.pid().to_string()),
             Ok(PKCHECK_NOT_AUTHORIZED)
         );
         assert!(bus.name_is_owned().await);
@@ -1307,7 +1346,7 @@ fn broken_rules_deny_everything_until_a_reload_fixes_them() {
         within("Changed", changes.next()).await.unwrap().unwrap();
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
         assert_eq!(
-            bus.pkcheck(DEFAULT, &me().to_string()),
+            bus.pkcheck(DEFAULT, &nobody.pid().to_string()),
             Ok(PKCHECK_AUTHORIZED)
         );
 
@@ -2327,18 +2366,20 @@ fn agents_only_get_requests_of_their_own_user() {
         let for_the_process = format!("x|process|{}|0", nobody_app.pid());
         let (_process_agent, _) = bus.agent("nobody", &for_the_process).unwrap();
 
-        // root's process in nobody's session (sudo at the seat) and daemon's (su daemon there):
-        // no agent of theirs, so a challenge, and no dialog anywhere.
-        let root_app = Sleeper::start(None);
-        bus.place(root_app.pid(), ByPid::Session("c2"));
+        // daemon's process in nobody's session (su daemon at the seat): no agent of its own, so a
+        // challenge, and no dialog anywhere.
         let daemon_in_c2 = Sleeper::start(Some("daemon"));
         bus.place(daemon_in_c2.pid(), ByPid::Session("c2"));
-        for app in [&root_app, &daemon_in_c2] {
-            let answer = bus
-                .check_with(&unix_process(app.pid()), SELF, HashMap::new(), ALLOW, "")
-                .await;
-            assert_eq!(answer, Ok((false, true, no_details())));
-        }
+        let answer = bus
+            .check_with(
+                &unix_process(daemon_in_c2.pid()),
+                SELF,
+                HashMap::new(),
+                ALLOW,
+                "",
+            )
+            .await;
+        assert_eq!(answer, Ok((false, true, no_details())));
         assert!(dialogs.none_pending());
 
         // daemon's own process in its session: its fallback agent. auth_admin: daemon is no

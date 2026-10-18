@@ -541,6 +541,12 @@ impl Authority {
                 ));
             }
         }
+        // Root is authorized for everything, before the rules and the defaults, as in polkitd
+        // (docs/DESIGN.md, "Root"). `identified.uid` was read under the process's pidfd or from
+        // the bus, so a PID reuse cannot make a non-root subject root.
+        if identified.uid == 0 {
+            return Ok(answer(Authorization::Yes));
+        }
         // What the decision needs from the policy is taken here: the lock is not held across the
         // waits that follow.
         let (decision, message, icon_name, administrators, generation) = {
