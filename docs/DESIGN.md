@@ -614,6 +614,23 @@ so does `async-io`, used by the tests for timeouts. `pkcheck` adds none: it pars
 hand and uses `zbus`, `futures-lite` and the daemon's own `Process`. `cargo deny` checks their
 licences and advisories on every pull request.
 
+## zbus 5, and a zvariant vulnerability
+
+zvariant parses what arrives on the bus, which is untrusted input, so a vulnerability in it matters
+to us. We stay on zbus 5 because zbus 6 needs Rust 1.89 and Debian 13 ships 1.85. If a
+vulnerability advisory lands on zvariant 5.x, `cargo deny` fails CI, and it keeps failing until the
+fix is in; `deny.toml` ignores only the three "unmaintained" notices, never a vulnerability.
+If the fix exists only in zbus/zvariant 6, we decide as follows:
+
+1. Backport it to the 5.x crate as our own patch, kept in this repository: a vendored, patched
+   copy under `patches/` wired in with `[patch.crates-io]`, with the upstream fix's commit noted
+   next to it. We never send it upstream. It ships as a nyra-polkit patch version.
+2. Only if a backport is not feasible, raise the minimum Rust to what zbus 6 needs and move to
+   zbus 6. Releases are already built with a pinned rustup toolchain (`release.yml`), so they
+   follow; the price is that Debian 13's own rustc can no longer build nyra-polkit.
+
+We move to zbus 6 when the minimum Rust is raised for another reason anyway.
+
 ## Sources
 
 Read for this design; nothing from polkit's source code.
