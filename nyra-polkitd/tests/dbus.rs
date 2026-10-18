@@ -2839,7 +2839,12 @@ fn user_with_password(name: &str, group: Option<&str>) -> String {
     }
     let mut random = [0u8; 16];
     rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty()).unwrap();
-    let password: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    // io::Write is already imported, so fmt::Write is brought in only for this String.
+    let mut password = String::with_capacity(random.len() * 2);
+    for byte in random {
+        std::fmt::Write::write_fmt(&mut password, format_args!("{byte:02x}"))
+            .expect("writing to a String cannot fail");
+    }
     let mut chpasswd = Command::new("chpasswd")
         .stdin(Stdio::piped())
         .spawn()
