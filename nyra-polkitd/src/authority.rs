@@ -19,7 +19,7 @@ use crate::temporary::{TemporaryAuthorizations, boot_clock};
 use crate::{Authorization, subject};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use zbus::fdo::DBusProxy;
 use zbus::message::Header;
@@ -40,6 +40,11 @@ const MAX_CHECKS_PER_CONNECTION: usize = 32;
 /// daemon can wait for (128 by default): one user alone must not fill them and lock out everyone
 /// else. Root is not counted: see [`ChecksInFlight::begin_for_user`].
 const MAX_CHECKS_PER_USER: usize = 64;
+/// Authentications one user may have waiting for an agent or in a dialog, whoever asked for them.
+/// They wait as long as the user's agent wants, so they do not count in the caller's connection:
+/// a system service asks for every user on one connection, and one user must not fill it. Beyond
+/// the limit the answer is the challenge, without a dialog.
+const MAX_AUTHENTICATIONS_PER_USER: usize = 16;
 /// What a caller is told when its subject cannot be identified. The reason goes to the journal
 /// only: it may name another user's process or uid.
 const SUBJECT_NOT_IDENTIFIED: &str = "cannot identify the subject";
@@ -112,6 +117,9 @@ pub struct Directories {
 pub struct Policy {
     pub actions: Actions,
     pub rules: Result<Rules, String>,
+    /// How many times the policy was reread before this one: an authentication that started under
+    /// another generation counts for nothing (see [`Authority::replace_policy`]).
+    pub generation: u64,
 }
 
 /// Loads the action definitions and the rules, logging what was read and every problem.
@@ -139,6 +147,7 @@ pub fn load_policy(directories: &Directories) -> Policy {
     Policy {
         actions,
         rules: rules.map(|(rules, _)| rules),
+        generation: 0,
     }
 }
 
@@ -148,10 +157,15 @@ pub fn load_policy(directories: &Directories) -> Policy {
 struct ChecksInFlight {
     by_caller: HashMap<String, CallerChecks>,
     by_user: HashMap<u32, usize>,
+    /// Authentications per subject user (see [`MAX_AUTHENTICATIONS_PER_USER`]).
+    authentications: HashMap<u32, usize>,
 }
 
 struct CallerChecks {
+    /// Checks in the connection's slots.
     count: usize,
+    /// Checks in an authentication: not in the slots, but the caller still has them.
+    authenticating: usize,
     cancellable: HashMap<String, async_channel::Sender<()>>,
     /// Never sent on, only kept: dropped with this when the caller leaves the bus, which closes
     /// the channel and so ends every check of the caller.
@@ -164,6 +178,7 @@ impl Default for CallerChecks {
         let (left, left_receiver) = async_channel::bounded(1);
         Self {
             count: 0,
+            authenticating: 0,
             cancellable: HashMap::new(),
             _left: left,
             left_receiver,
@@ -236,7 +251,7 @@ impl ChecksInFlight {
         };
         checks.count -= 1;
         checks.cancellable.remove(cancellation_id);
-        if checks.count == 0 {
+        if checks.count == 0 && checks.authenticating == 0 {
             self.by_caller.remove(caller);
         }
     }
@@ -267,6 +282,35 @@ impl ChecksInFlight {
         }
         *count += 1;
         Ok(())
+    }
+
+    /// A check of `caller` starts an authentication for user `uid`: counted for that user and no
+    /// longer in the caller's connection. False when the user already has too many.
+    fn begin_authentication(&mut self, caller: &str, uid: u32) -> bool {
+        let count = self.authentications.entry(uid).or_default();
+        if *count >= MAX_AUTHENTICATIONS_PER_USER {
+            return false;
+        }
+        *count += 1;
+        if let Some(checks) = self.by_caller.get_mut(caller) {
+            checks.count -= 1;
+            checks.authenticating += 1;
+        }
+        true
+    }
+
+    /// The authentication ended: the check counts in its caller's connection again until it ends.
+    fn end_authentication(&mut self, caller: &str, uid: u32) {
+        if let Some(count) = self.authentications.get_mut(&uid) {
+            *count -= 1;
+            if *count == 0 {
+                self.authentications.remove(&uid);
+            }
+        }
+        if let Some(checks) = self.by_caller.get_mut(caller) {
+            checks.authenticating -= 1;
+            checks.count += 1;
+        }
     }
 
     fn end_for_user(&mut self, uid: u32) {
@@ -302,6 +346,19 @@ struct UserInFlight<'a> {
 impl Drop for UserInFlight<'_> {
     fn drop(&mut self) {
         lock(self.checks).end_for_user(self.uid);
+    }
+}
+
+/// Ends an authentication in [`ChecksInFlight`] however the check ends.
+struct AuthenticationInFlight<'a> {
+    checks: &'a Mutex<ChecksInFlight>,
+    caller: &'a str,
+    uid: u32,
+}
+
+impl Drop for AuthenticationInFlight<'_> {
+    fn drop(&mut self) {
+        lock(self.checks).end_authentication(self.caller, self.uid);
     }
 }
 
@@ -387,12 +444,20 @@ impl Authority {
 
     /// Replaces the policy in force (`systemctl reload`). The temporary authorizations go with
     /// the old rules: they were granted under them.
-    pub fn replace_policy(&self, policy: Policy) {
-        *self
+    ///
+    /// An authentication running meanwhile was decided under the old rules (who may authenticate,
+    /// at what level): it ends not authorized and keeps nothing. The temporary authorizations are
+    /// cleared while the new policy is written, and an authentication compares the generation and
+    /// keeps its authorization while it reads the policy, so none can slip in between.
+    pub fn replace_policy(&self, mut policy: Policy) {
+        let mut current = self
             .policy
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        policy.generation = current.generation + 1;
+        *current = policy;
         let dropped = lock(&self.temporary).clear();
+        drop(current);
         if dropped > 0 {
             eprintln!("<6>{dropped} temporary authorizations revoked: the rules were reread");
         }
@@ -471,7 +536,7 @@ impl Authority {
         }
         // What the decision needs from the policy is taken here: the lock is not held across the
         // waits that follow.
-        let (decision, message, icon_name, administrators) = {
+        let (decision, message, icon_name, administrators, generation) = {
             let policy = self.read_policy();
             let rules = match &policy.rules {
                 Ok(rules) => rules,
@@ -495,6 +560,7 @@ impl Authority {
                 action.map(|action| action.message.clone()),
                 action.map(|action| action.icon_name.clone()),
                 rules.administrators.clone(),
+                policy.generation,
             )
         };
         if matches!(decision, Authorization::Yes | Authorization::No) {
@@ -550,6 +616,28 @@ impl Authority {
             );
             return Ok(answer(Authorization::No));
         }
+        if !lock(&self.checks).begin_authentication(caller, identified.uid) {
+            eprintln!(
+                "<4>{action_id} for user {}: too many authentications of this user (at most {MAX_AUTHENTICATIONS_PER_USER}), so no dialog",
+                identified.uid
+            );
+            return Ok(challenge());
+        }
+        let _authentication_in_flight = AuthenticationInFlight {
+            checks: &self.checks,
+            caller,
+            uid: identified.uid,
+        };
+        eprintln!(
+            "<6>authentication for {action_id} of user {} (process {:?}) waits for an agent",
+            identified.uid,
+            identified.process.map(|process| process.pid)
+        );
+        // An agent runs one authentication at a time; the agent is chosen again once it is this
+        // one's turn, as the one chosen first may have gone meanwhile.
+        let Some((agent, _turn)) = self.agent_turn(&identified, agent).await else {
+            return Ok(challenge());
+        };
         // A root caller may give the dialog its own text (`polkit.message`, `polkit.icon_name`:
         // only root may pass them, see check_details).
         let message = match details.get("polkit.message") {
@@ -570,12 +658,29 @@ impl Authority {
             details: &details,
             identities: &identities,
         };
-        match self
+        let outcome = self
             .authenticate(connection, &agent, &identified, &request)
-            .await?
-        {
-            Authenticated::As(_) if keep => {
-                let id = lock(&self.temporary).add(action_id, &identified, decision, boot_clock());
+            .await?;
+        // Kept, or not, while the policy is read: a reload cannot come between the comparison and
+        // the authorization being kept.
+        let kept = match outcome {
+            Authenticated::As(_) => {
+                let policy = self.read_policy();
+                if policy.generation != generation {
+                    eprintln!(
+                        "<4>{action_id} for user {}: the rules were reread during the authentication, so it is not authorized",
+                        identified.uid
+                    );
+                    return Ok(answer(Authorization::No));
+                }
+                keep.then(|| {
+                    lock(&self.temporary).add(action_id, &identified, decision, boot_clock())
+                })
+            }
+            Authenticated::Dismissed | Authenticated::Failed => None,
+        };
+        match (outcome, kept) {
+            (Authenticated::As(_), Some(id)) => {
                 eprintln!(
                     "<6>temporary authorization {id} created for {action_id} of user {}",
                     identified.uid
@@ -590,19 +695,36 @@ impl Authority {
                 );
                 Ok(result)
             }
-            Authenticated::As(_) => Ok(answer(Authorization::Yes)),
-            Authenticated::Dismissed => {
+            (Authenticated::As(_), None) => Ok(answer(Authorization::Yes)),
+            (Authenticated::Dismissed, _) => {
                 let mut result = answer(Authorization::No);
                 result
                     .details
                     .insert("polkit.dismissed".to_string(), "true".to_string());
                 Ok(result)
             }
-            Authenticated::Failed => Ok(answer(Authorization::No)),
+            (Authenticated::Failed, _) => Ok(answer(Authorization::No)),
         }
     }
 
-    /// Runs one authentication through `agent`, once the agent is free: it is authenticated only if
+    /// Waits until an agent for `subject` is free, starting with `agent`: the agent and its turn, or
+    /// `None` once no agent serves the subject any more.
+    async fn agent_turn(
+        &self,
+        subject: &Identified,
+        mut agent: Agent,
+    ) -> Option<(Agent, async_lock::MutexGuardArc<()>)> {
+        loop {
+            let turn = agent.busy.lock_arc().await;
+            let current = lock(&self.agents).for_subject(subject)?;
+            if Arc::ptr_eq(&current.busy, &agent.busy) {
+                return Some((agent, turn));
+            }
+            agent = current;
+        }
+    }
+
+    /// Runs one authentication through `agent`, during its turn: it is authenticated only if
     /// `AuthenticationAgentResponse2` was accepted for its cookie and the agent then returned.
     async fn authenticate(
         &self,
@@ -611,7 +733,6 @@ impl Authority {
         subject: &Identified,
         request: &agents::Request<'_>,
     ) -> Result<Authenticated, Error> {
-        let _turn = agent.busy.lock().await;
         let cookie = lock(&self.cookies)
             .add(agent.uid, request.identities.to_vec())
             .map_err(|error| {
@@ -1202,6 +1323,53 @@ mod tests {
         checks.end(":1.1", "a");
         assert!(!checks.cancel(":1.1", "a"));
         assert!(checks.by_caller.is_empty());
+    }
+
+    #[test]
+    fn authentications_count_per_user_and_not_in_the_connection() {
+        let mut checks = ChecksInFlight::default();
+        for _ in 0..32 {
+            checks.begin(":1.1", "").unwrap();
+        }
+        // 16 wait for nobody's agent, a 17th of nobody gets no dialog; daemon has their own 16.
+        for _ in 0..16 {
+            assert!(checks.begin_authentication(":1.1", 65534));
+        }
+        assert!(!checks.begin_authentication(":1.1", 65534));
+        assert!(checks.begin_authentication(":1.1", 1));
+        // Those 17 left the connection's slots: 17 more checks fit, not 18.
+        for _ in 0..17 {
+            assert!(checks.begin(":1.1", "").is_ok());
+        }
+        assert!(checks.begin(":1.1", "").is_err());
+        checks.end_authentication(":1.1", 1);
+        for _ in 0..16 {
+            checks.end_authentication(":1.1", 65534);
+        }
+        assert!(checks.authentications.is_empty());
+        assert_eq!(checks.by_caller[":1.1"].count, 32 + 17);
+
+        // Two checks of one caller in authentications: when one ends, the other is still the
+        // caller's, not ended as if the caller had left.
+        let first = checks.begin(":1.3", "").unwrap();
+        let second = checks.begin(":1.3", "").unwrap();
+        assert!(checks.begin_authentication(":1.3", 65534));
+        assert!(checks.begin_authentication(":1.3", 65534));
+        checks.end_authentication(":1.3", 65534);
+        checks.end(":1.3", "");
+        drop(first);
+        assert_eq!(
+            second.caller_left.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        );
+        checks.end_authentication(":1.3", 65534);
+        checks.end(":1.3", "");
+        assert!(!checks.by_caller.contains_key(":1.3"));
+        // A caller that left: its authentications still end.
+        assert!(checks.begin_authentication(":1.2", 65534));
+        checks.caller_left(":1.2");
+        checks.end_authentication(":1.2", 65534);
+        assert!(checks.authentications.is_empty());
     }
 
     #[test]

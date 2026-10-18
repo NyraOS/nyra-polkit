@@ -295,8 +295,23 @@ When the decision is `auth_*` and the caller passed `AllowUserInteraction`:
 `CancelCheckAuthorization`, or the caller leaving the bus, sends `CancelAuthentication(cookie)` to
 the agent and ends the check with `Cancelled`; the cookie is forgotten with the check. The caller
 leaving ends all its checks, interactive or not. An agent handles one authentication at a time;
-later requests wait their turn. The daemon's bus policy lets its user call agents
+later requests wait their turn, and the agent is chosen again when the turn comes (the one chosen
+first may have been unregistered meanwhile). The daemon's bus policy lets its user call agents
 (`org.freedesktop.PolicyKit1.AuthenticationAgent`), which are ordinary connections of the users.
+
+**The rules decide before the dialog.** The decision and the identities offered come from the
+rules in force when the check started. If the rules are reread while the authentication runs (an
+administrator removed, a result changed), the check ends not authorized and keeps nothing, even
+when the helper answers for an identity offered before. The rules carry a generation number; the
+authentication compares it, and keeps its temporary authorization, while it reads the rules, and a
+reload clears the temporary authorizations while it writes them, so nothing granted under the old
+rules survives.
+
+**Waiting does not take a service's slots.** A check that waits for an agent can wait as long as
+the user takes, and system services ask for every user on one connection. So once a check goes to
+an agent it no longer counts in its caller's 32; it counts in its subject user's authentications
+instead, at most 16 waiting or in a dialog. Beyond that the answer is the challenge, without a
+dialog. A user whose agent never closes its dialogs only holds their own requests.
 
 ## Temporary authorizations
 
@@ -315,13 +330,13 @@ wins at once.
 
 It ends early when its bus name leaves the bus, on `RevokeTemporaryAuthorizations` /
 `RevokeTemporaryAuthorizationById` (`pkcheck --revoke-temp`), when the rules are reread (all of
-them), or when the daemon restarts (they are kept in memory only). One for a process that exited, or
-for a session that ended, can no longer be used, since a new process or session never has the same
-start time or id; it stays in the list until it expires. Expiry is checked whenever the list is
-used, on the boot clock, so an expired authorization is never used or listed; no timer runs for it,
-so no `Changed` is sent at that moment. Details are not compared: the same action
-and subject succeed even with other details, as polkit(8) says; rules that depend on details should
-not use the `_keep` results.
+them; and an authentication still running then keeps none), or when the daemon restarts (they are
+kept in memory only). One for a process that exited, or for a session that ended, can no longer be
+used, since a new process or session never has the same start time or id; it stays in the list until
+it expires. Expiry is checked whenever the list is used, on the boot clock, so an expired
+authorization is never used or listed; no timer runs for it, so no `Changed` is sent at that moment.
+Details are not compared: the same action and subject succeed even with other details, as polkit(8)
+says; rules that depend on details should not use the `_keep` results.
 
 `EnumerateTemporaryAuthorizations` and `RevokeTemporaryAuthorizations` take any subject: a session
 stands for every authorization of the subject's user in that session (`pkcheck --list-temp` and
@@ -352,6 +367,8 @@ Threat model:
 | a local user | write rules | rule files and directories must be root's and not writable by others |
 | a sandboxed app | act as more than its user | it is identified like any other client of the system bus, by the bus |
 | anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user other than root, and 16 agents per user; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
+| a local user | fill a system service's connection with dialogs that never close, so its checks for everyone else fail | checks waiting for an agent leave the connection's 32 and count per subject user (at most 16); beyond that, the challenge without a dialog |
+| an administrator's change | be undone by a dialog opened before it | an authentication that started under rules since reread is not authorized and keeps nothing |
 | a broken or hostile action file | crash or bloat the daemon | parse errors skip the file (its actions stay unknown, so denied); no external DTD or entity loading; node and size limits |
 | an administrator's typo | open more than meant | unknown keys are errors, and any error denies everything |
 
@@ -369,16 +386,17 @@ with no capabilities, only `AF_UNIX` sockets, a read-only view of the system and
 sandboxing. It can still read other users' `/proc/<pid>/stat` and `status` and open their pidfds,
 which is all it needs. It never runs code from rules and never calls out to the network.
 
-**Limits.** A user can open many connections to the bus (dbus-daemon allows 256 per user), and
-every check may wait on logind, while the bus limits the replies the daemon itself may be waiting
-for (128 by default). So besides the 32 checks per connection, one user (the callers' uid) has at
-most 64 checks in flight over all their connections, and no user alone can fill the daemon's
-replies. Root is not counted: root's callers are the system services (logind, NetworkManager,
-udisks2...), and a user can make them ask on the user's behalf, so one pool shared by all of them
-would let one user use it up and make every service's checks fail for everyone. Each service
-connection keeps its limit of 32, and users cannot open connections as root. Reads of `/proc` and
-of the user database (NSS, which may be LDAP or SSSD) run as blocking tasks, off the bus executor,
-so a slow lookup holds only its own check.
+**Limits.** A user can open many connections to the bus (dbus-daemon allows 256 per user), and every
+check may wait on logind, while the bus limits the replies the daemon itself may be waiting for (128
+by default). So besides the 32 checks per connection, one user (the callers' uid) has at most 64
+checks in flight over all their connections, and no user alone can fill the daemon's replies. Checks
+waiting for an agent are counted apart, per subject user (see "Authentication"), so the dialogs of
+one user cannot fill a service's connection either. Root is not counted: root's callers are the
+system services (logind, NetworkManager, udisks2...), and a user can make them ask on the user's
+behalf, so one pool shared by all of them would let one user use it up and make every service's
+checks fail for everyone. Each service connection keeps its limit of 32, and users cannot open
+connections as root. Reads of `/proc` and of the user database (NSS, which may be LDAP or SSSD) run
+as blocking tasks, off the bus executor, so a slow lookup holds only its own check.
 
 **No memory limit in the unit.** The bus accepts messages up to 32 MiB, and zbus turns a call's
 arguments into Rust values before the daemon sees the call or its size, so one `CheckAuthorization`
@@ -405,7 +423,8 @@ To the journal, with sd-daemon priority prefixes:
   most once a minute, with the number of checks denied since the last one, so the journal cannot
   be flooded.
 - **Agents:** each registration and removal (user, session or process, bus name, fallback or not).
-- **Authentications:** each attempt and its result (action, subject user and PID, the agent, the
+- **Authentications:** each attempt (when it starts waiting for an agent, and when it reaches one)
+  and its result (action, subject user and PID, the agent, the
   identities offered and the one authenticated, authorized, dismissed or failed), and each
   `AuthenticationAgentResponse2` refused, with the reason.
 - **Temporary authorizations:** created, used, and revoked or expired.

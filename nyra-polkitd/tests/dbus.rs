@@ -2496,3 +2496,155 @@ fn temporary_authorizations_keep_their_subject_and_level() {
         assert!(!in_c2(&bus).contains(&id));
     });
 }
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn a_reload_during_the_dialog_authorizes_nothing() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("reload-dialog", "").await;
+        let daemon_session = FakeSession {
+            uid: DAEMON,
+            ..LOCAL_ACTIVE
+        };
+        bus.add_session("c4", daemon_session).await;
+        let dialogs = bus.relay().await;
+        let (_agent, _) = bus.agent("daemon", "daemon|session|c4|0").unwrap();
+        let app = Sleeper::start(Some("daemon"));
+        bus.place(app.pid(), ByPid::Session("c4"));
+        let subject = unix_process(app.pid());
+
+        // auth_admin_keep: nobody and bin are offered. While the dialog is up, the administrator
+        // takes nobody out of the administrators and reloads; then nobody's password is given.
+        let checking = bus.check_with(&subject, CHALLENGE, HashMap::new(), ALLOW, "");
+        let helping = async {
+            let dialog = dialogs.next().await;
+            assert_eq!(dialog.identities, [BIN, NOBODY]);
+            write_trusted(
+                &bus.directory.join("local/50-test.toml"),
+                "[administrators]\nusers = [\"bin\"]\n",
+            );
+            bus.reload();
+            bus.logged("administrators: users [\"bin\"]");
+            assert_eq!(bus.respond(DAEMON, &dialog.cookie, NOBODY).await, Ok(()));
+            dialog.agent_returns().await;
+        };
+        let (answer, ()) = futures_lite::future::zip(checking, helping).await;
+        // Decided under the old rules: not authorized, and nothing kept.
+        assert_eq!(answer, Ok((false, false, no_details())));
+        bus.logged("the rules were reread during the authentication");
+        let again = bus
+            .check_with(&subject, CHALLENGE, HashMap::new(), 0, "")
+            .await;
+        assert_eq!(
+            again.map(|(authorized, challenge, _)| (authorized, challenge)),
+            Ok(CHALLENGED)
+        );
+        assert!(
+            !bus.log().contains("temporary authorization nyra-tmp"),
+            "{}",
+            bus.log()
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn waiting_authentications_do_not_fill_a_services_connection() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("authentication-limits", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.place(me(), ByPid::Session("c1"));
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let daemon_session = FakeSession {
+            uid: DAEMON,
+            ..LOCAL_ACTIVE
+        };
+        bus.add_session("c4", daemon_session).await;
+        // Agents whose users never close the dialog.
+        let _dialogs = bus.relay().await;
+        let (_nobody_agent, _) = bus.agent("nobody", "nobody|session|c2|0").unwrap();
+        let (_daemon_agent, _) = bus.agent("daemon", "daemon|session|c4|0").unwrap();
+        let nobody_app = Sleeper::start(Some("nobody"));
+        bus.place(nobody_app.pid(), ByPid::Session("c2"));
+        let daemon_app = Sleeper::start(Some("daemon"));
+        bus.place(daemon_app.pid(), ByPid::Session("c4"));
+
+        // A system service (root) asks on behalf of nobody and of daemon, 16 times each, on one
+        // connection: 32 checks wait for their agents.
+        let service = connect(&bus.address).await;
+        for app in [&nobody_app, &daemon_app] {
+            for _ in 0..16 {
+                send_interactive_check(&service, &unix_process(app.pid()), SELF).await;
+            }
+        }
+        wait_until("32 authentications", || {
+            bus.log().matches("waits for an agent").count() == 32
+        });
+        let ask = |subject: Subject, action: &'static str, flags: u32| {
+            let service = &service;
+            async move {
+                let reply = service
+                    .call_method(
+                        Some(NAME),
+                        PATH,
+                        Some(INTERFACE),
+                        "CheckAuthorization",
+                        &(&subject, action, HashMap::<&str, &str>::new(), flags, ""),
+                    )
+                    .await
+                    .map_err(error_name)?;
+                Ok::<Answer, String>(reply.body().deserialize::<Answer>().unwrap())
+            }
+        };
+        // A 17th for nobody gets the challenge at once, without a dialog.
+        let answer = ask(unix_process(nobody_app.pid()), SELF, ALLOW).await;
+        assert_eq!(answer, Ok((false, true, no_details())));
+        bus.logged("too many authentications of this user");
+        // The service's other checks are still answered: the waits are not in its 32.
+        assert_eq!(
+            ask(unix_process(me()), DEFAULT, 0).await,
+            Ok((true, false, no_details()))
+        );
+        assert_eq!(
+            ask(unix_process(daemon_app.pid()), DEFAULT, 0).await,
+            Ok((true, false, no_details()))
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn a_queued_check_goes_to_the_agent_that_serves_it_at_its_turn() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("agent-turn", "").await;
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let dialogs = bus.relay().await;
+        let (mut agent, _) = bus.agent("nobody", "nobody|session|c2|0").unwrap();
+        let (_fallback, _) = bus.agent("nobody", "nobody-fallback|session|c2|1").unwrap();
+        let app = Sleeper::start(Some("nobody"));
+        bus.place(app.pid(), ByPid::Session("c2"));
+        let subject = unix_process(app.pid());
+
+        let first = bus.check_with(&subject, SELF, HashMap::new(), ALLOW, "");
+        let second = bus.check_with(&subject, SELF, HashMap::new(), ALLOW, "");
+        let driving = async {
+            let dialog = dialogs.next().await;
+            assert_eq!(dialog.agent, "nobody");
+            // The other check waits for the same agent, which then unregisters, its connection
+            // staying on the bus.
+            wait_until("the second check waiting", || {
+                bus.log().matches("waits for an agent").count() == 2
+            });
+            assert_eq!(agent.unregister(), "unregistered");
+            dialog.dismiss().await;
+            let dialog = dialogs.next().await;
+            assert_eq!(dialog.agent, "nobody-fallback");
+            dialog.dismiss().await;
+        };
+        let ((first, second), ()) =
+            futures_lite::future::zip(futures_lite::future::zip(first, second), driving).await;
+        let dismissed = HashMap::from([("polkit.dismissed".to_string(), "true".to_string())]);
+        assert_eq!(first, Ok((false, false, dismissed.clone())));
+        assert_eq!(second, Ok((false, false, dismissed)));
+    });
+}

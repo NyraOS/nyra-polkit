@@ -59,18 +59,10 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Direct
     Ok(directories)
 }
 
-/// What the daemon waits for once it serves.
-enum Event {
-    /// SIGHUP: reread the action files and the rules.
-    Reload,
-    /// A connection left the bus (its unique name).
-    Left(String),
-}
-
 async fn serve(directories: Directories) -> Result<(), String> {
     // Before taking the bus name: from then on, a reload may come at any time, and SIGHUP's
     // default action would end the daemon.
-    let hangups = async_signal::Signals::new([async_signal::Signal::Hup])
+    let mut hangups = async_signal::Signals::new([async_signal::Signal::Hup])
         .map_err(|error| format!("SIGHUP: {error}"))?;
 
     // Broken rules do not stop the daemon: it keeps the name and denies every check until a
@@ -84,7 +76,7 @@ async fn serve(directories: Directories) -> Result<(), String> {
         .map_err(|error| format!("system bus: {error}"))?;
     // Connections that leave end their checks and remove their agents. Watched before anyone can
     // call the authority, so no departure is missed.
-    let departures = DBusProxy::new(&connection)
+    let mut departures = DBusProxy::new(&connection)
         .await
         .map_err(|error| error.to_string())?
         .receive_name_owner_changed()
@@ -93,41 +85,51 @@ async fn serve(directories: Directories) -> Result<(), String> {
         .filter_map(|signal| {
             let args = signal.args().ok()?;
             let unique = args.name().as_str().starts_with(':');
-            (unique && args.new_owner().is_none()).then(|| Event::Left(args.name().to_string()))
+            (unique && args.new_owner().is_none()).then(|| args.name().to_string())
         });
     connection
         .object_server()
         .at(AUTHORITY_PATH, authority)
         .await
         .map_err(|error| error.to_string())?;
+    let authority = connection
+        .object_server()
+        .interface::<_, Authority>(AUTHORITY_PATH)
+        .await
+        .map_err(|error| error.to_string())?;
+    // Read from now on, in a task of its own: zbus holds every message of the connection, replies
+    // included, while a stream is full, so a stream read only later could stall the RequestName
+    // below and everything after it.
+    let departed = authority.clone();
+    connection
+        .executor()
+        .spawn(
+            async move {
+                while let Some(name) = departures.next().await {
+                    if departed.get().await.connection_left(&name) {
+                        if let Err(error) = Authority::changed(departed.signal_emitter()).await {
+                            eprintln!("<4>Changed signal: {error}");
+                        }
+                    }
+                }
+            },
+            "departures",
+        )
+        .detach();
     connection
         .request_name(BUS_NAME)
         .await
         .map_err(|error| format!("system bus, {BUS_NAME}: {error}"))?;
     eprintln!("<6>serving {BUS_NAME}");
 
-    let authority = connection
-        .object_server()
-        .interface::<_, Authority>(AUTHORITY_PATH)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut events = futures_lite::stream::or(hangups.map(|_| Event::Reload), departures);
-    while let Some(event) = events.next().await {
-        let changed = match event {
-            Event::Reload => {
-                eprintln!("<6>reloading the action files and the rules");
-                authority
-                    .get()
-                    .await
-                    .replace_policy(load_policy(&directories));
-                true
-            }
-            Event::Left(name) => authority.get().await.connection_left(&name),
-        };
-        if changed {
-            if let Err(error) = Authority::changed(authority.signal_emitter()).await {
-                eprintln!("<4>Changed signal: {error}");
-            }
+    while hangups.next().await.is_some() {
+        eprintln!("<6>reloading the action files and the rules");
+        authority
+            .get()
+            .await
+            .replace_policy(load_policy(&directories));
+        if let Err(error) = Authority::changed(authority.signal_emitter()).await {
+            eprintln!("<4>Changed signal: {error}");
         }
     }
     Ok(())
