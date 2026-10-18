@@ -77,6 +77,14 @@ const ACTIONS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
       <allow_active>yes</allow_active>
     </defaults>
   </action>
+  <action id="org.nyra.test.owned-by-name">
+    <annotate key="org.freedesktop.policykit.owner">unix-user:nobody</annotate>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
   <!-- Without "unix-user:", 42 names nobody. -->
   <action id="org.nyra.test.owned-bare">
     <annotate key="org.freedesktop.policykit.owner">42</annotate>
@@ -157,6 +165,7 @@ const CHALLENGE: &str = "org.nyra.test.challenge";
 const UNKNOWN: &str = "org.nyra.test.unknown";
 const OWNED: &str = "org.nyra.test.owned";
 const OWNED_BARE: &str = "org.nyra.test.owned-bare";
+const OWNED_BY_NAME: &str = "org.nyra.test.owned-by-name";
 const SELF: &str = "org.nyra.test.self";
 const SELF_KEEP: &str = "org.nyra.test.self-keep";
 const ADMIN: &str = "org.nyra.test.admin";
@@ -842,6 +851,21 @@ async fn arrivals(at_logind: &async_channel::Receiver<()>, count: usize) {
     .await;
 }
 
+/// The daemon's timeout on logind (`CALL_TIMEOUT` in main.rs): a check held at the fake logind
+/// ends by itself after it.
+const LOGIND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Fails, saying why, when more than half of [`LOGIND_TIMEOUT`] has passed since `sent` the first
+/// of the checks a limit test holds at logind: the limit would then be checked against checks
+/// that may already have timed out. The other half is the margin for the last assertions.
+fn assert_still_held(sent: Instant) {
+    assert!(
+        sent.elapsed() < LOGIND_TIMEOUT / 2,
+        "too slow: the held checks were sent {:?} ago and time out after {LOGIND_TIMEOUT:?}",
+        sent.elapsed()
+    );
+}
+
 // --- The tests ---------------------------------------------------------------------------------
 
 #[test]
@@ -1094,10 +1118,29 @@ fn the_display_session_counts_under_the_users_own_manager() {
             Ok(NO)
         );
 
+        // A user under their own manager but with no display session (a server's lingering
+        // user): the answer for no session, not a refusal as for a logind that fails.
+        bus.add_user_with_display(DAEMON, "").await;
+        let daemon_manager = user_slice.join("user-1.slice/user@1.service");
+        std::fs::create_dir_all(&daemon_manager).unwrap();
+        let lingering = Sleeper::start(Some("daemon"));
+        std::fs::write(
+            daemon_manager.join("cgroup.procs"),
+            lingering.pid().to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            bus.check(&unix_process(lingering.pid()), DEFAULT).await,
+            Ok(NO)
+        );
+
         drop(app);
+        drop(lingering);
         for cgroup in [
             &manager,
             &manager.parent().unwrap().to_path_buf(),
+            &daemon_manager,
+            &daemon_manager.parent().unwrap().to_path_buf(),
             &user_slice.to_path_buf(),
         ] {
             let _ = std::fs::remove_dir(cgroup);
@@ -1330,6 +1373,15 @@ fn the_owner_annotation_lets_a_user_check_others() {
 
         // "unix-user:42": uid 42 gets root's answer (allow_active, "yes").
         assert_eq!(as_42(OWNED), Ok(PKCHECK_AUTHORIZED));
+        // "unix-user:nobody": the user's name counts, over the bus, as its uid does; 42 is not it.
+        assert_eq!(
+            bus.pkcheck_as(
+                Some("nobody"),
+                &["--action-id", OWNED_BY_NAME, "--process", &root_pid]
+            ),
+            Ok(PKCHECK_AUTHORIZED)
+        );
+        assert_eq!(as_42(OWNED_BY_NAME), Err(NOT_AUTHORIZED.to_string()));
         // A bare "42" is not an identity; nor does the annotation of one action open another.
         assert_eq!(as_42(OWNED_BARE), Err(NOT_AUTHORIZED.to_string()));
         assert_eq!(as_42(DEFAULT), Err(NOT_AUTHORIZED.to_string()));
@@ -1434,7 +1486,16 @@ fn actions_properties_and_cancellation() {
         assert_eq!(
             ids,
             [
-                ADMIN, CHALLENGE, DEFAULT, DENIED, LEVELS, OWNED, OWNED_BARE, RULED, SELF,
+                ADMIN,
+                CHALLENGE,
+                DEFAULT,
+                DENIED,
+                LEVELS,
+                OWNED,
+                OWNED_BARE,
+                OWNED_BY_NAME,
+                RULED,
+                SELF,
                 SELF_KEEP
             ]
         );
@@ -1544,6 +1605,7 @@ fn the_limit_per_connection_holds_and_root_has_no_limit_per_user() {
 
         // 32 checks wait on one connection: a 33rd is refused at once.
         let first = connect(&bus.address).await;
+        let sent = Instant::now();
         for _ in 0..32 {
             send_check(&first, &slow_subject).await;
         }
@@ -1566,9 +1628,11 @@ fn the_limit_per_connection_holds_and_root_has_no_limit_per_user() {
             send_check(&second, &slow_subject).await;
         }
         arrivals(&at_logind, 32).await;
+        assert_still_held(sent);
         // Root's connections are the system services': 64 checks of root in flight do not stop a
         // third one.
         assert_eq!(bus.check(&me_subject, DEFAULT).await, Ok(YES));
+        assert_still_held(sent);
     });
 }
 
@@ -1586,6 +1650,7 @@ fn a_user_has_at_most_64_checks_in_flight() {
         let pkcheck_slow = ["--action-id", DEFAULT, "--process", &slow_pid];
 
         // 64 checks of nobody wait on logind, each from its own pkcheck (its own connection).
+        let sent = Instant::now();
         let mut waiting: Vec<Child> = (0..64)
             .map(|_| {
                 Command::new("setpriv")
@@ -1608,6 +1673,7 @@ fn a_user_has_at_most_64_checks_in_flight() {
         );
         // Other users are not affected.
         assert_eq!(bus.check(&unix_process(me()), DEFAULT).await, Ok(YES));
+        assert_still_held(sent);
         for pkcheck in &mut waiting {
             let _ = pkcheck.kill();
             let _ = pkcheck.wait();
