@@ -15,7 +15,7 @@ agents and services such as NetworkManager, udisks2 and Flatpak need no change.
 
 Requirements:
 
-- Linux with systemd (`u!` in the sysusers line needs systemd 250 or newer; Debian 13 has 257),
+- Linux with systemd (`u!` in the sysusers line needs systemd 257 or newer, where it was added; Debian 13 and sid have it),
   logind (`systemd-logind`) and a system bus that gives each caller's process file descriptor
   (`ProcessFD`; Debian 13's dbus 1.16 does, an older one makes every check fail).
 - x86_64 or aarch64 with glibc, a kernel with pidfds (`pidfd_open(2)`), and root.
@@ -37,7 +37,22 @@ mkdir /tmp/nyra-polkit && tar -C /tmp/nyra-polkit --strip-components=1 --no-same
 cd /tmp/nyra-polkit
 ```
 
-Install the two binaries and the four `dist/` files, each where its first lines say:
+Three of the files collide with ones of Debian's `polkitd` package. Copying over them would be
+undone by the next upgrade of that package without dpkg knowing, so divert them: dpkg then moves
+Debian's files aside and keeps them out of the way. Check the owner first (`dpkg -S /usr/bin/pkcheck`
+names `polkitd`; if your release ships it elsewhere, divert the same path regardless):
+
+```sh
+for f in /usr/bin/pkcheck \
+  /usr/share/dbus-1/system.d/org.freedesktop.PolicyKit1.conf \
+  /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
+  dpkg-divert --local --rename --add "$f"
+done
+```
+
+The other files have names Debian's packages do not use (`nyra-polkit.service` is not
+`polkit.service`, which is only masked below), so they need no diversion. Install the two binaries
+and the four `dist/` files, each where its first lines say:
 
 ```sh
 install -D -m 0755 bin/nyra-polkitd /usr/libexec/nyra-polkitd
@@ -50,9 +65,7 @@ install -D -m 0644 dist/org.freedesktop.PolicyKit1.service \
 install -D -m 0644 dist/nyra-polkit.sysusers /usr/lib/sysusers.d/nyra-polkit.conf
 ```
 
-This overwrites the bus policy, activation file and `pkcheck` of Debian's `polkitd` package
-(section 5 restores them), and an upgrade of that package overwrites them again: repeat these
-commands after one.
+Upgrades of `polkitd` now leave these three files alone (section 5 restores Debian's).
 
 **Write your rules before you start** (section 3). Without an `[administrators]` table only root
 is one, so `auth_admin` asks for root's password. At least:
@@ -181,19 +194,26 @@ journalctl -u nyra-polkit.service -b
 
 ## 5. Going back to polkitd
 
-Stop the daemon, remove what you installed, put Debian's files back, unmask and start:
+Stop the daemon, remove what you installed, remove the diversions (dpkg moves Debian's files
+back), unmask and start:
 
 ```sh
 systemctl stop nyra-polkit.service
 rm /usr/libexec/nyra-polkitd /usr/lib/systemd/system/nyra-polkit.service \
-  /usr/lib/sysusers.d/nyra-polkit.conf
-apt install --reinstall polkitd
+  /usr/lib/sysusers.d/nyra-polkit.conf /usr/bin/pkcheck \
+  /usr/share/dbus-1/system.d/org.freedesktop.PolicyKit1.conf \
+  /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service
+for f in /usr/bin/pkcheck \
+  /usr/share/dbus-1/system.d/org.freedesktop.PolicyKit1.conf \
+  /usr/share/dbus-1/system-services/org.freedesktop.PolicyKit1.service; do
+  dpkg-divert --rename --remove "$f"
+done
 systemctl unmask polkit.service
 systemctl daemon-reload
 systemctl reload dbus
 systemctl start polkit.service
 ```
 
-The reinstall puts back Debian's `pkcheck`, bus policy and activation file. The `polkitd` user
+Debian's `pkcheck`, bus policy and activation file are back. The `polkitd` user
 stays (Debian's own). Your TOML files are no longer read and may be removed. Check with
 `busctl --system status org.freedesktop.PolicyKit1`: the owner is `polkitd` again.
