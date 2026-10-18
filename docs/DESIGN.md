@@ -500,8 +500,9 @@ that the same daemon still answers.
 
 The files that install it are in `dist/`: the systemd unit (`nyra-polkit.service`, with this
 sandboxing), the bus policy (only `polkitd` may own the name; anyone may call it), the bus
-activation file and the sysusers.d line for `polkitd`. A static user rather than `DynamicUser=`: the
-bus policy names the user, and the bus reads it before a dynamic user would exist.
+activation file and the sysusers.d line for `polkitd` (`u!`, a locked account, as on Debian). A
+static user rather than `DynamicUser=`: the bus policy names the user, and the bus reads it before a
+dynamic user would exist.
 
 ## Logging
 

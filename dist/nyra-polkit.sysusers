@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: MIT
 # /usr/lib/sysusers.d/nyra-polkit.conf: the daemon's system user, the one the bus policy lets own
-# org.freedesktop.PolicyKit1. The same name as polkitd's user on Debian.
-u polkitd - "polkit authority (nyra-polkitd)" - -
+# org.freedesktop.PolicyKit1. The same name as polkitd's user on Debian,
+# and locked (`u!`) as there: no password login.
+u! polkitd - "polkit authority (nyra-polkitd)" - -
