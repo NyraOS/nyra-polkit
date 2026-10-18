@@ -394,11 +394,9 @@ mod tests {
     /// A new, empty `rules.d` in a new directory of its own (removed with [`remove`]), and the uid
     /// that owns it (the user running the tests), which stands for root here.
     fn temporary_directory(name: &str) -> (PathBuf, u32) {
-        let parent =
-            std::env::temp_dir().join(format!("nyra-polkit-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&parent);
+        let parent = crate::unique_temp_dir(name);
         let directory = parent.join("rules.d");
-        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::create_dir(&directory).unwrap();
         for path in [&parent, &directory] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }

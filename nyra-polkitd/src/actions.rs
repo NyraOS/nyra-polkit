@@ -361,9 +361,7 @@ mod tests {
 
     #[test]
     fn loads_a_directory_skipping_bad_files_and_duplicates() {
-        let directory =
-            std::env::temp_dir().join(format!("nyra-polkit-actions-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::unique_temp_dir("actions");
         std::fs::write(directory.join("a.policy"), POLICY).unwrap();
         let other = r#"<policyconfig><action id="org.example.other"/></policyconfig>"#;
         std::fs::write(directory.join("b.policy"), other).unwrap();
@@ -386,9 +384,7 @@ mod tests {
 
     #[test]
     fn a_fifo_is_refused_instead_of_blocking() {
-        let directory =
-            std::env::temp_dir().join(format!("nyra-polkit-actions-fifo-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::unique_temp_dir("actions-fifo");
         rustix::fs::mknodat(
             rustix::fs::CWD,
             directory.join("a.policy"),

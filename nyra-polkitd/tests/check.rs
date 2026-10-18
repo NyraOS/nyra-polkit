@@ -12,6 +12,18 @@ fn daemon(arguments: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+/// A new, empty directory with a random suffix; `create_dir` fails if the path already exists.
+fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+    let mut random = [0u8; 8];
+    rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty()).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "nyra-polkit-{name}-{:016x}",
+        u64::from_le_bytes(random)
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
 #[test]
 fn help_mentions_check() {
     let output = daemon(&["--help"]);
@@ -21,10 +33,9 @@ fn help_mentions_check() {
 
 #[test]
 fn check_exits_0_for_valid_files_and_1_for_a_broken_one() {
-    let root = std::env::temp_dir().join(format!("nyra-polkit-check-bin-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = unique_temp_dir("check-bin");
     let actions = root.join("actions");
-    std::fs::create_dir_all(&actions).unwrap();
+    std::fs::create_dir(&actions).unwrap();
     let missing = root.join("missing");
     let arguments = |actions: &std::path::Path| {
         [
@@ -53,4 +64,17 @@ fn check_exits_0_for_valid_files_and_1_for_a_broken_one() {
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("broken.policy"));
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_option_value_that_looks_like_an_option_is_refused() {
+    for option in ["--actions-dir", "--image-rules-dir", "--local-rules-dir"] {
+        let output = daemon(&[option, "--check"]);
+        assert_eq!(output.status.code(), Some(2), "{option}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(option) && stderr.contains("--check"),
+            "{stderr}"
+        );
+    }
 }

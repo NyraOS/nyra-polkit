@@ -121,18 +121,33 @@ pub fn is_valid_action_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
 }
 
+/// A new, empty directory in the temporary directory, with a random suffix so that no one can
+/// have prepared the path: `create_dir` fails if it already exists.
+#[cfg(test)]
+pub(crate) fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+    let mut random = [0u8; 8];
+    rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty()).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "nyra-polkit-{name}-{:016x}",
+        u64::from_le_bytes(random)
+    ));
+    std::fs::create_dir(&path).unwrap();
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn refuses_files_over_the_size_limit() {
-        let path = std::env::temp_dir().join(format!("nyra-polkit-size-{}", std::process::id()));
+        let directory = unique_temp_dir("size");
+        let path = directory.join("file");
         std::fs::write(&path, vec![b' '; MAX_FILE_SIZE as usize]).unwrap();
         assert!(read_config_file(&path).is_ok());
         std::fs::write(&path, vec![b' '; MAX_FILE_SIZE as usize + 1]).unwrap();
         let error = read_config_file(&path).unwrap_err();
-        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
         assert!(error.contains("larger than"), "{error}");
     }
 }

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
-//! Our pkcheck next to Debian's, against nyra-polkitd on a private, system-like bus (docs/DESIGN.md,
-//! "Tests"): for the same options, both must exit with the same code, print the same details and
-//! comparable diagnostics. The bus is set up as in nyra-polkitd's `tests/dbus.rs`: the bus policy
-//! from `dist/`, the daemon as the `polkitd` user, and a fake logind that knows no session.
+//! Our pkcheck next to Debian's, against nyra-polkitd on a private, system-like bus
+//! (docs/DESIGN.md, "Tests"): for the same options, both must exit with the same code, print the
+//! same details and comparable diagnostics. The bus is set up as in nyra-polkitd's `tests/dbus.rs`:
+//! the bus policy from `dist/`, the daemon as the `polkitd` user, and a fake logind that knows no
+//! session.
 //!
 //! Needs root, a writable `/sys/fs/cgroup` (to put pkcheck in a session's scope), `dbus-daemon`,
 //! Debian's `pkcheck`, `setpriv`, `setsid`, the users `polkitd` and `nobody`, and nyra-polkitd

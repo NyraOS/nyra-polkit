@@ -1489,8 +1489,7 @@ mod tests {
     /// A directory tree of mode 755 that the test user owns, standing in for root's.
     fn check_setup(name: &str) -> (PathBuf, Directories, u32) {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let root = std::env::temp_dir().join(format!("nyra-polkit-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        let root = crate::unique_temp_dir(name);
         let directories = Directories {
             actions: root.join("actions"),
             image_rules: root.join("image"),
