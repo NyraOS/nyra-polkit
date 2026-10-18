@@ -197,6 +197,13 @@ pub async fn identify(
     }
 }
 
+/// Whether the uid of an identified subject is known race-free: a bus name has the bus's
+/// credentials, a session has logind's, and a process whose client sent the uid it saw (that
+/// `read_unix_process` checked) cannot have changed since. A process without one is only read.
+pub fn uid_is_race_free(kind: &str, details: &HashMap<String, OwnedValue>) -> bool {
+    kind != "unix-process" || matches!(optional_uid(details), Ok(Some(_)))
+}
+
 /// Pins the process of a `unix-process` subject and reads its start time, its real uid and its
 /// cgroup. Blocking (`/proc`): call it as a blocking task.
 fn read_unix_process(

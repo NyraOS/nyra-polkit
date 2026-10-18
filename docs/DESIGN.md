@@ -178,6 +178,26 @@ definition is right cannot be known. An action file that declares an XML entity 
 refused as a whole, logged, and its actions are unknown: real files declare none, and expanding
 entities could blow a small file up to hundreds of megabytes. The usual `<!DOCTYPE>` line is fine.
 
+**Root is authorized for every known action, before the rules.** A subject whose user is uid 0
+gets "authorized" (`yes`) from `CheckAuthorization`, as in polkitd: no rule and no default is
+looked at, so a `no` rule and a default of `no` answer yes for root, and broken rules (which deny
+everyone else) do not stop root. An unknown action is still refused, for root too, before this
+case (see above). Why:
+
+- root can do everything the answer would guard anyway: a refusal protects nothing, and only
+  breaks programs that ask on root's behalf;
+- compatibility with polkitd: udisks2 asks about root too, and `udisksctl mount` as root in a
+  session without a seat (default `auth_admin`) must work as it does with polkitd.
+
+The check comes once the subject is identified (see "Subjects") and after the rule that only root
+or an `org.freedesktop.policykit.owner` user may ask about another user's subject, so that rule
+holds for root's subjects too. It applies only when the subject's uid is known race-free: a bus
+name (the bus's credentials), a session (logind), or a process whose client sent the uid it saw
+and it matched the one read. A `unix-process` subject without a uid is only read from `/proc`, so
+it has no shortcut: the rules and defaults decide, as for any user. pkcheck always sends the uid.
+The rules cannot take this away: it is not a rule. pkcheck has no case of its own; it asks the
+authority and prints what it answers.
+
 ## Rules
 
 Rule files are TOML: the image's in `/usr/share/nyra-polkit/rules.d/*.toml`, the administrator's
