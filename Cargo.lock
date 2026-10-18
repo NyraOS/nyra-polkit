@@ -399,6 +399,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyra-pkcheck"
+version = "0.1.0"
+dependencies = [
+ "async-io",
+ "futures-lite",
+ "nix",
+ "nyra-polkitd",
+ "zbus",
+]
+
+[[package]]
 name = "nyra-polkitd"
 version = "0.1.0"
 dependencies = [
