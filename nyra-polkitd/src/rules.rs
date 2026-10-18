@@ -139,7 +139,11 @@ pub fn load_rules(image: &Path, local: &Path) -> Result<Loaded, String> {
 
 /// [`load_rules`], with the owner the directories and files must have: root (0), except in the
 /// tests, which cannot create files owned by root.
-fn load_rules_owned_by(image: &Path, local: &Path, owner: u32) -> Result<Loaded, String> {
+pub(crate) fn load_rules_owned_by(
+    image: &Path,
+    local: &Path,
+    owner: u32,
+) -> Result<Loaded, String> {
     let mut files: BTreeMap<String, PathBuf> = rule_files(image, owner)?.into_iter().collect();
     let mut replaced: BTreeMap<String, PathBuf> = BTreeMap::new();
     for (name, path) in rule_files(local, owner)? {
@@ -278,8 +282,11 @@ fn read_trusted_file(path: &Path, owner: u32) -> Result<String, String> {
 fn check_owner_and_mode(metadata: &Metadata, path: &Path, owner: u32) -> Result<(), String> {
     if metadata.uid() != owner || metadata.mode() & 0o022 != 0 {
         return Err(format!(
-            "{}: must be owned by root and not writable by group or others",
-            path.display()
+            "{}: must be owned by root and not writable by group or others (it is owned by uid \
+             {}, mode {:o})",
+            path.display(),
+            metadata.uid(),
+            metadata.mode() & 0o7777
         ));
     }
     Ok(())

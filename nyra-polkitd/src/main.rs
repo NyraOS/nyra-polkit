@@ -2,11 +2,14 @@
 //! nyra-polkitd: owns `org.freedesktop.PolicyKit1` on the system bus and answers authorization
 //! checks (docs/DESIGN.md). SIGHUP (`systemctl reload`) rereads the action files and the rules.
 //!
-//! The options only move the directories, for tests; the service uses the standard ones.
+//! `--check` loads the files like the service and reports, without the bus. The other options only
+//! move the directories, for tests; the service uses the standard ones.
 
 use futures_lite::StreamExt;
 use nyra_polkitd::actions::ACTIONS_DIR;
-use nyra_polkitd::authority::{AUTHORITY_PATH, Authority, BUS_NAME, Directories, load_policy};
+use nyra_polkitd::authority::{
+    AUTHORITY_PATH, Authority, BUS_NAME, Directories, check_policy, load_policy,
+};
 use nyra_polkitd::rules::{IMAGE_RULES_DIR, LOCAL_RULES_DIR};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -18,17 +21,34 @@ use zbus::fdo::DBusProxy;
 /// timeout. zbus has no timeout of its own: without this, a stuck logind would hold every check.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
-const USAGE: &str =
-    "usage: nyra-polkitd [--actions-dir DIR] [--image-rules-dir DIR] [--local-rules-dir DIR]";
+const USAGE: &str = "usage: nyra-polkitd [--check] [--actions-dir DIR] [--image-rules-dir DIR] \
+[--local-rules-dir DIR]
+  --check  read the action files and the rules as the service does, print what would be read,
+           replaced or switched off and every problem, and exit 0 if they are valid, 1 if not;
+           does not use the bus";
+
+enum Mode {
+    Serve,
+    Check,
+    Help,
+}
 
 fn main() -> ExitCode {
-    let directories = match parse_arguments(std::env::args().skip(1)) {
-        Ok(directories) => directories,
+    let (mode, directories) = match parse_arguments(std::env::args().skip(1)) {
+        Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("{error}\n{USAGE}");
             return ExitCode::from(2);
         }
     };
+    match mode {
+        Mode::Help => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Mode::Check => return check(&directories),
+        Mode::Serve => {}
+    }
     match futures_lite::future::block_on(serve(directories)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -38,14 +58,38 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Directories, String> {
+/// Prints what the service would log when it loads the files; errors go to standard error.
+fn check(directories: &Directories) -> ExitCode {
+    let valid = check_policy(directories, |level, message| match level {
+        3 => eprintln!("error: {message}"),
+        4 => println!("warning: {message}"),
+        _ => println!("{message}"),
+    });
+    if valid {
+        println!("the action files and the rules are valid");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("the action files or the rules are not valid");
+        ExitCode::FAILURE
+    }
+}
+
+fn parse_arguments(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(Mode, Directories), String> {
     let mut directories = Directories {
         actions: PathBuf::from(ACTIONS_DIR),
         image_rules: PathBuf::from(IMAGE_RULES_DIR),
         local_rules: PathBuf::from(LOCAL_RULES_DIR),
     };
+    let mut mode = Mode::Serve;
     while let Some(option) = arguments.next() {
         let directory = match option.as_str() {
+            "--check" => {
+                mode = Mode::Check;
+                continue;
+            }
+            "--help" => return Ok((Mode::Help, directories)),
             "--actions-dir" => &mut directories.actions,
             "--image-rules-dir" => &mut directories.image_rules,
             "--local-rules-dir" => &mut directories.local_rules,
@@ -56,7 +100,7 @@ fn parse_arguments(mut arguments: impl Iterator<Item = String>) -> Result<Direct
             .map(PathBuf::from)
             .ok_or_else(|| format!("{option} needs a directory"))?;
     }
-    Ok(directories)
+    Ok((mode, directories))
 }
 
 async fn serve(directories: Directories) -> Result<(), String> {
@@ -141,6 +185,13 @@ mod tests {
 
     fn parse(arguments: &[&str]) -> Result<Directories, String> {
         parse_arguments(arguments.iter().map(|argument| argument.to_string()))
+            .map(|(_, directories)| directories)
+    }
+
+    fn mode(arguments: &[&str]) -> Mode {
+        parse_arguments(arguments.iter().map(|argument| argument.to_string()))
+            .unwrap()
+            .0
     }
 
     #[test]
@@ -157,5 +208,16 @@ mod tests {
 
         assert!(parse(&["--actions-dir"]).is_err());
         assert!(parse(&["--rules", "/x"]).is_err());
+    }
+
+    #[test]
+    fn check_and_help_are_modes() {
+        assert!(matches!(mode(&[]), Mode::Serve));
+        assert!(matches!(mode(&["--check"]), Mode::Check));
+        assert!(matches!(
+            mode(&["--actions-dir", "/t", "--check"]),
+            Mode::Check
+        ));
+        assert!(matches!(mode(&["--help"]), Mode::Help));
     }
 }

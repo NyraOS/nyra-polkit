@@ -239,7 +239,14 @@ A rule holds when every condition it sets holds:
 Unknown keys, wrong types and malformed action ids are errors. **Any error in any rule file, or a
 rule file or directory that is not trusted, makes the daemon deny every request** until it is fixed
 (see "Logging"). The daemon keeps running and keeps its bus name, so clients get an answer, not a
-missing service; `systemctl reload` once the files are fixed restores normal answers. Skipping the broken
+missing service; `systemctl reload` once the files are fixed restores normal answers. To find out
+before the reload, run `nyra-polkitd --check`: it loads the action files and the rules with the
+same code, directories and ownership and mode checks as the service, without touching the bus. It
+prints one line per file read, replaced or switched off, per warning and per error (errors on
+standard error) and exits 0 if the files are valid, 1 if not; warnings do not change the exit
+status. A problem in an action file counts as an error there, although the service only skips the
+file. Run as an ordinary user it reads what it is allowed to, and says when a file or directory is
+not owned by root. Skipping the broken
 file could drop a rule that denies something, and a typo such as `sesion = "active"` must never
 turn into a rule that matches every session.
 
