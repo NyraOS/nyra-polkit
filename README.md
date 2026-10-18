@@ -100,10 +100,11 @@ has a tarball per architecture, `nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz` and
 - `dist/`: the systemd unit, the D-Bus policy and activation file and the sysusers file, each
   naming where it is installed in its first lines;
 - `LICENSE`, `README.md`, `SECURITY.md`;
-- `Cargo.lock`: the lock file the binaries were built with (`--locked`), for listing the exact crates
-  and versions in an SBOM;
-- `third-party/`: the licence files of every crate built into the binaries, and `CRATES`, their
-  list with versions and licences.
+- `Cargo.lock`: the exact lock the binaries were built with (`--locked`). It covers the whole
+  workspace resolution (dev and build dependencies, other targets), so it lists more than is
+  compiled in;
+- `third-party/`: the licence files of every crate compiled into the binaries, and `CRATES`, their
+  list with versions and licences: use it for an SBOM of what the binaries contain.
 
 To check a download, first compare it with `SHA256SUMS` from the same release:
 
