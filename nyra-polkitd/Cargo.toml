@@ -31,6 +31,14 @@ async-signal = "0.2.14"
 async-channel = "2.5.0"
 # - block_on for main and racing a check against its cancellation.
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+# - NSS lookups and /proc reads as blocking tasks, off the bus executor, so a slow user database
+#   (LDAP, SSSD) cannot stall every other check;
+blocking = "1.7.0"
 # A user's name and groups from the user database (NSS: getpwuid_r, getgrouplist), without unsafe
 # code here. Only its "user" feature.
 nix = { version = "0.31.3", default-features = false, features = ["user"] }
+
+[dev-dependencies]
+# Timers for the integration tests' timeouts, so a regression fails instead of hanging the job.
+# Already in zbus's dependency tree: no crate added.
+async-io = "2.6.0"

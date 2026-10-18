@@ -57,11 +57,15 @@ identity is `(sa{sv})`: a kind and its details.
 | `RevokeTemporaryAuthorizationById` | `s` id | the authorization's user, or root |
 
 The caller is always identified by the bus (`GetConnectionCredentials` on its unique name), never by
-what it says. Properties: `BackendName` = `nyra-polkit`, `BackendVersion`, `BackendFeatures` = 1
-(temporary authorizations; 0 until authentication agents are served, since no temporary
-authorization can be obtained before). `CheckAuthorization` returns one struct, `(bba{ss})`, not
-three values: polkit's client library expects the struct. The `Changed` signal is sent after the rules are reread and when a
-temporary authorization appears, expires or is revoked. Errors use the documented names
+what it says. A subject that cannot be identified is refused with a generic `NotAuthorized`
+("cannot identify the subject"); the reason goes only to the journal, since it may name other
+users' processes and uids, which `/proc` mounted with `hidepid` would hide.
+
+Properties: `BackendName` = `nyra-polkit`, `BackendVersion`, `BackendFeatures` = 1 (temporary
+authorizations; 0 until authentication agents are served, since no temporary authorization can be
+obtained before). `CheckAuthorization` returns one struct, `(bba{ss})`, not three values: polkit's
+client library expects the struct. The `Changed` signal is sent after the rules are reread and when
+a temporary authorization appears, expires or is revoked. Errors use the documented names
 (`org.freedesktop.PolicyKit1.Error.Failed`, `Cancelled`, `NotSupported`, `NotAuthorized`,
 `CancellationIdNotUnique`).
 
@@ -99,7 +103,18 @@ been given to another process in between, so what was read is about the right pr
 
 **Session state**, from logind. A process's session is `GetSessionByPID`. Only the error
 `org.freedesktop.login1.NoSessionForPID` means "no session"; any other failure (logind unreachable,
-a timeout, an unexpected reply) ends the check with `NotAuthorized`, never with `allow_any`.
+no answer within 10 s, an unexpected reply) ends the check with `NotAuthorized`, never with
+`allow_any`. The 10 s are well under the 25 s that D-Bus clients usually wait, so a stuck logind
+gives them a refusal, not their own timeout.
+
+**A session of another user is not the subject's.** When the session `GetSessionByPID` returns
+belongs to another user (its `User`), the subject has no local session (`allow_any`). Only root
+keeps the session's state. `GetSessionByPID` gives the session a process was started in, not one of
+its user: whoever sits at the seat and runs `su B` or `sudo -u B` in a terminal leaves B's
+processes in their own local, active session. B may be logged in only over SSH, and can reach
+those processes from there (ptrace, where the ptrace scope allows it, or their files), so they must
+not get `allow_active`. Root is the exception because root in a user's session (`sudo udisksctl`)
+was started by the person at the seat, and root can do anything anyway.
 
 A process without a session gets its user's display session (`User.Display`) only when its cgroup
 (`/proc/<pid>/cgroup`, read under the pidfd) is inside that same user's
@@ -309,9 +324,10 @@ Threat model:
 | a local process | answer an authentication | `AuthenticationAgentResponse2` only from root; random single-use cookies tied to the agent's user |
 | another user's agent | see or answer requests of a session | every agent, fallback agents included, only gets requests for subjects of its own user |
 | a remote user (SSH) | use the desktop's `allow_active` from the SSH session | the SSH session is remote, and the user manager's session has no seat: both `allow_any` |
+| a remote user (SSH) | use their processes left in another user's local session (`su`, `sudo -u` at the seat) | a session of another user is not local, except for root |
 | a local user | write rules | rule files and directories must be root's and not writable by others |
 | a sandboxed app | act as more than its user | it is identified like any other client of the system bus, by the bus |
-| anyone | exhaust the daemon | at most 32 checks in flight per connection; size limits on files; no recursion on input |
+| anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user other than root; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
 | a broken or hostile action file | crash or bloat the daemon | parse errors skip the file (its actions stay unknown, so denied); no external DTD or entity loading; node and size limits |
 | an administrator's typo | open more than meant | unknown keys are errors, and any error denies everything |
 
@@ -328,6 +344,27 @@ The service runs as the unprivileged system user `polkitd` (the user that may ow
 with no capabilities, only `AF_UNIX` sockets, a read-only view of the system and the usual systemd
 sandboxing. It can still read other users' `/proc/<pid>/stat` and `status` and open their pidfds,
 which is all it needs. It never runs code from rules and never calls out to the network.
+
+**Limits.** A user can open many connections to the bus (dbus-daemon allows 256 per user), and
+every check may wait on logind, while the bus limits the replies the daemon itself may be waiting
+for (128 by default). So besides the 32 checks per connection, one user (the callers' uid) has at
+most 64 checks in flight over all their connections, and no user alone can fill the daemon's
+replies. Root is not counted: root's callers are the system services (logind, NetworkManager,
+udisks2...), and a user can make them ask on the user's behalf, so one pool shared by all of them
+would let one user use it up and make every service's checks fail for everyone. Each service
+connection keeps its limit of 32, and users cannot open connections as root. Reads of `/proc` and
+of the user database (NSS, which may be LDAP or SSSD) run as blocking tasks, off the bus executor,
+so a slow lookup holds only its own check.
+
+**No memory limit in the unit.** The bus accepts messages up to 32 MiB, and zbus turns a call's
+arguments into Rust values before the daemon sees the call or its size, so one `CheckAuthorization`
+from any user with 32 MiB of small details takes the daemon to about 250 MB for a moment. A
+`MemoryMax=` below that lets any user have the daemon killed (OOM) with one call; repeated, the
+kills hit systemd's start limit and every check then fails for everyone. `MemoryHigh=` only slows
+the daemon until it stops answering. So the unit sets no memory limit: memory is bounded by the
+bus's limits (message size, connections per user) and the checks in flight. An integration test
+sends such a call to the daemon in a cgroup with the unit's memory settings and no swap, and checks
+that the same daemon still answers.
 
 The files that install it are in `dist/`: the systemd unit (`nyra-polkit.service`, with this
 sandboxing), the bus policy (only `polkitd` may own the name; anyone may call it), the bus
@@ -348,6 +385,8 @@ To the journal, with sd-daemon priority prefixes:
   authenticated, authorized, dismissed or failed), and each `AuthenticationAgentResponse2` refused.
 - **Temporary authorizations:** created, used, and revoked or expired.
 - **Action files:** files skipped and action ids dropped as defined twice.
+- **Refused subjects:** why a subject could not be identified (the caller only gets a generic
+  error), and a caller whose credentials the bus does not give.
 
 Cookies are never logged.
 
@@ -362,9 +401,12 @@ Cookies are never logged.
   a private `dbus-daemon` with the system bus's default policy and the bus policy from `dist/`
   stands in for the system bus (`DBUS_SYSTEM_BUS_ADDRESS`), and `nyra-polkitd` runs as the
   `polkitd` user with test action and rule directories. logind is a fake served by the test on the
-  same bus, so each test process can be given any session, no session, or a logind failure (a
-  generic mock cannot answer `GetSessionByPID` per PID). Clients: Debian's `pkcheck` and
-  our `pkcheck` (same exit codes: 0, 1, 2, 3, 126, 127), `libpolkit-gobject-1` through GObject
+  same bus, so each test process can be given any session, no session, a logind failure, no answer
+  at all, or an answer held back until the test has acted (a generic mock cannot answer
+  `GetSessionByPID` per PID). The container is privileged, so that a test can put a process under
+  a user's service manager (a cgroup). Every wait of the tests has a timeout, so a regression fails
+  instead of hanging. Clients: Debian's `pkcheck`, `busctl` (for the subjects `pkcheck` cannot send,
+  `unix-session`) and our `pkcheck` (same exit codes: 0, 1, 2, 3, 126, 127), `libpolkit-gobject-1` through GObject
   introspection (`CheckAuthorization`, `EnumerateActions`, temporary authorizations, cancellation),
   and a test agent on `libpolkit-agent-1` with the real `polkit-agent-helper-1` and a test user in
   the container. The bus traffic of these clients is recorded, which is how the subject details
@@ -377,9 +419,10 @@ Cookies are never logged.
 
 Few, and each justified in `Cargo.toml`: `roxmltree` (action XML), `serde` and `toml` (rules),
 `zbus` (the bus, with its own small async runtime, no tokio) and `nix` (user names and groups from
-NSS). `rustix` (pidfds), `async-signal` (SIGHUP), `async-channel` (cancellation) and `futures-lite`
-are used directly but come with zbus anyway. `cargo deny` checks their licences and advisories on
-every pull request.
+NSS). `rustix` (pidfds), `async-signal` (SIGHUP), `async-channel` (cancellation), `blocking` (NSS
+and `/proc` reads off the executor) and `futures-lite` are used directly but come with zbus anyway;
+so does `async-io`, used by the tests for timeouts. `cargo deny` checks their licences and
+advisories on every pull request.
 
 ## Sources
 
@@ -398,8 +441,11 @@ Read for this design; nothing from polkit's source code.
   <https://www.freedesktop.org/software/polkit/docs/latest/PolkitSystemBusName.html>
 - D-Bus Specification (`GetConnectionCredentials`, `ProcessFD`, unique names):
   <https://dbus.freedesktop.org/doc/dbus-specification.html>
+- dbus-daemon(1) and the default limits listed in the system bus configuration
+  (`/usr/share/dbus-1/system.conf`: `max_connections_per_user` 256, `max_replies_per_connection`
+  128): <https://dbus.freedesktop.org/doc/dbus-daemon.1.html>
 - org.freedesktop.login1(5) (`GetSession`, `GetSessionByPID`, `Session.Active`, `Session.Remote`,
-  `User.Display`): <https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html>
+  `Session.User`, `User.Display`): <https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html>
 - Linux man pages: pidfd_open(2), proc(5) (`/proc/<pid>/stat` start time, `status` `Uid:`,
   `fdinfo` `Pid:`).
 - Observed: action files installed on Debian 13 by systemd and others (`<annotate>` values are the

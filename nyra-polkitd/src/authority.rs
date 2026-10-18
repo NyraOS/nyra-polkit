@@ -29,6 +29,14 @@ pub const AUTHORITY_PATH: &str = "/org/freedesktop/PolicyKit1/Authority";
 const ALLOW_USER_INTERACTION: u32 = 1;
 /// Checks one connection may have in flight (docs/DESIGN.md, "Security").
 const MAX_CHECKS_PER_CONNECTION: usize = 32;
+/// Checks one user other than root may have in flight over all their connections. A user may open
+/// many connections, and every check may wait on logind, while the bus limits the replies the
+/// daemon can wait for (128 by default): one user alone must not fill them and lock out everyone
+/// else. Root is not counted: see [`ChecksInFlight::begin_for_user`].
+const MAX_CHECKS_PER_USER: usize = 64;
+/// What a caller is told when its subject cannot be identified. The reason goes to the journal
+/// only: it may name another user's process or uid.
+const SUBJECT_NOT_IDENTIFIED: &str = "cannot identify the subject";
 /// While the rules are broken, the message saying so is logged at most this often.
 const BROKEN_RULES_LOG_INTERVAL: Duration = Duration::from_secs(60);
 /// The `polkit.` details callers may set (the documented ones), and only as root.
@@ -121,10 +129,11 @@ pub fn load_policy(directories: &Directories) -> Policy {
 }
 
 /// The checks in flight, per caller (a unique bus name): how many, and the cancellation ids of
-/// those that have one, with what cancels them.
+/// those that have one, with what cancels them; and how many per user (the callers' uid).
 #[derive(Default)]
 struct ChecksInFlight {
     by_caller: HashMap<String, CallerChecks>,
+    by_user: HashMap<u32, usize>,
 }
 
 #[derive(Default)]
@@ -182,6 +191,36 @@ impl ChecksInFlight {
             .and_then(|checks| checks.cancellable.get(cancellation_id))
             .is_some_and(|sender| sender.try_send(()).is_ok())
     }
+
+    /// Counts a check of user `uid`, once the caller's uid is known (after [`Self::begin`]).
+    ///
+    /// Root's checks are not counted: root's callers are the system services (logind,
+    /// NetworkManager, udisks2...), which a user can make ask on their behalf. One pool for all of
+    /// them would let one user use it up for everyone. Each of their connections keeps its own
+    /// limit, and users cannot open connections as root.
+    fn begin_for_user(&mut self, uid: u32) -> Result<(), Error> {
+        if uid == 0 {
+            return Ok(());
+        }
+        let count = self.by_user.entry(uid).or_default();
+        if *count >= MAX_CHECKS_PER_USER {
+            return Err(Error::Failed(format!(
+                "too many checks in flight (at most {MAX_CHECKS_PER_USER} per user)"
+            )));
+        }
+        *count += 1;
+        Ok(())
+    }
+
+    fn end_for_user(&mut self, uid: u32) {
+        let Some(count) = self.by_user.get_mut(&uid) else {
+            return;
+        };
+        *count -= 1;
+        if *count == 0 {
+            self.by_user.remove(&uid);
+        }
+    }
 }
 
 /// Ends a check in [`ChecksInFlight`] however the check ends.
@@ -194,6 +233,18 @@ struct InFlight<'a> {
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         lock(self.checks).end(&self.caller, &self.cancellation_id);
+    }
+}
+
+/// Ends a check of a user in [`ChecksInFlight`] however the check ends.
+struct UserInFlight<'a> {
+    checks: &'a Mutex<ChecksInFlight>,
+    uid: u32,
+}
+
+impl Drop for UserInFlight<'_> {
+    fn drop(&mut self) {
+        lock(self.checks).end_for_user(self.uid);
     }
 }
 
@@ -252,38 +303,55 @@ impl Authority {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
     }
 
+    fn read_policy(&self) -> std::sync::RwLockReadGuard<'_, Policy> {
+        self.policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     async fn check(
         &self,
         connection: &Connection,
         caller: &str,
         (kind, subject_details): (String, HashMap<String, OwnedValue>),
         action_id: &str,
-        details: &HashMap<String, String>,
+        details: HashMap<String, String>,
     ) -> Result<AuthorizationResult, Error> {
         let caller_uid = subject::bus_uid(connection, caller)
             .await
-            .map_err(Error::Failed)?;
-        check_details(details, caller_uid)?;
+            .map_err(|error| {
+                eprintln!("<4>check from {caller}: {error}");
+                Error::Failed("cannot identify the caller".to_string())
+            })?;
+        lock(&self.checks).begin_for_user(caller_uid)?;
+        let _user_in_flight = UserInFlight {
+            checks: &self.checks,
+            uid: caller_uid,
+        };
+        check_details(&details, caller_uid)?;
+
+        let not_identified = |error: String| {
+            eprintln!("<4>check of {action_id} from {caller}: {SUBJECT_NOT_IDENTIFIED}: {error}");
+            Error::NotAuthorized(SUBJECT_NOT_IDENTIFIED.to_string())
+        };
         let identified = subject::identify(connection, &kind, &subject_details)
             .await
-            .map_err(|error| {
-                Error::NotAuthorized(format!("cannot identify the subject: {error}"))
-            })?;
-        let (user, groups) = subject::user_and_groups(identified.uid)
-            .map_err(|error| Error::NotAuthorized(format!("subject: {error}")))?;
+            .map_err(not_identified)?;
+        let uid = identified.uid;
+        let (user, groups) = blocking::unblock(move || subject::user_and_groups(uid))
+            .await
+            .map_err(not_identified)?;
 
-        let policy = self
-            .policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if identified.uid != caller_uid
-            && caller_uid != 0
-            && !may_check_for_others(&policy.actions, action_id, caller_uid)
-        {
-            return Err(Error::NotAuthorized(
-                "only root may check the authorization of another user's subject".to_string(),
-            ));
+        if identified.uid != caller_uid && caller_uid != 0 {
+            let caller_name = blocking::unblock(move || subject::user_name(caller_uid)).await;
+            let policy = self.read_policy();
+            if !may_check_for_others(&policy.actions, action_id, caller_uid, caller_name) {
+                return Err(Error::NotAuthorized(
+                    "only root may check the authorization of another user's subject".to_string(),
+                ));
+            }
         }
+        let policy = self.read_policy();
         let rules = match &policy.rules {
             Ok(rules) => rules,
             Err(error) => {
@@ -295,7 +363,7 @@ impl Authority {
                 return Ok(answer(Authorization::No));
             }
         };
-        let details: std::collections::BTreeMap<_, _> = details.clone().into_iter().collect();
+        let details: std::collections::BTreeMap<_, _> = details.into_iter().collect();
         let subject = Subject {
             user,
             groups,
@@ -333,17 +401,18 @@ fn check_details(details: &HashMap<String, String>, caller_uid: u32) -> Result<(
 
 /// Whether the action's `org.freedesktop.policykit.owner` annotation names the caller
 /// (`unix-user:<name or uid>`, separated by spaces), which then may check other users' subjects.
-fn may_check_for_others(actions: &Actions, action_id: &str, caller_uid: u32) -> bool {
+fn may_check_for_others(
+    actions: &Actions,
+    action_id: &str,
+    caller_uid: u32,
+    caller_name: Option<String>,
+) -> bool {
     let Some(owners) = actions
         .get(action_id)
         .and_then(|action| action.annotations.get(OWNER_ANNOTATION))
     else {
         return false;
     };
-    let caller_name = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(caller_uid))
-        .ok()
-        .flatten()
-        .map(|user| user.name);
     owners
         .split_whitespace()
         .filter_map(|identity| identity.strip_prefix("unix-user:"))
@@ -384,10 +453,7 @@ impl Authority {
     pub async fn changed(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
 
     fn enumerate_actions(&self, locale: String) -> Vec<ActionDescription> {
-        let policy = self
-            .policy
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let policy = self.read_policy();
         policy
             .actions
             .values()
@@ -434,7 +500,7 @@ impl Authority {
             caller: caller.clone(),
             cancellation_id: cancellation_id.clone(),
         };
-        let check = self.check(connection, &caller, subject, &action_id, &details);
+        let check = self.check(connection, &caller, subject, &action_id, details);
         let cancellation = async {
             match cancelled {
                 Some(cancelled) => {
@@ -528,18 +594,21 @@ mod tests {
             .into_iter()
             .map(|action| (action.id.clone(), action))
             .collect();
-        assert!(may_check_for_others(&actions, "org.example.color", 42));
-        // By name: root is uid 0 everywhere.
-        assert!(may_check_for_others(&actions, "org.example.color", 0));
-        assert!(!may_check_for_others(&actions, "org.example.color", 43));
-        assert!(!may_check_for_others(&actions, "org.example.plain", 42));
-        assert!(!may_check_for_others(&actions, "org.example.unknown", 42));
+        let may = |action_id, uid, name: Option<&str>| {
+            may_check_for_others(&actions, action_id, uid, name.map(str::to_string))
+        };
+        assert!(may("org.example.color", 42, None));
+        assert!(may("org.example.color", 0, Some("root")));
+        assert!(!may("org.example.color", 43, Some("someone")));
+        assert!(!may("org.example.plain", 42, None));
+        assert!(!may("org.example.unknown", 42, None));
     }
 
     #[test]
     fn checks_in_flight_are_capped_and_ids_unique_per_caller() {
+        // Fixed numbers, not the constants: the limits are part of the design.
         let mut checks = ChecksInFlight::default();
-        for _ in 0..MAX_CHECKS_PER_CONNECTION {
+        for _ in 0..32 {
             assert!(checks.begin(":1.1", "").is_ok());
         }
         assert!(matches!(checks.begin(":1.1", ""), Err(Error::Failed(_))));
@@ -553,6 +622,27 @@ mod tests {
         assert!(checks.begin(":1.1", "a").is_ok());
         checks.end(":1.2", "a");
         assert!(checks.begin(":1.2", "a").is_ok());
+    }
+
+    #[test]
+    fn checks_in_flight_are_capped_per_user() {
+        let mut checks = ChecksInFlight::default();
+        for _ in 0..64 {
+            assert!(checks.begin_for_user(1000).is_ok());
+        }
+        assert!(matches!(checks.begin_for_user(1000), Err(Error::Failed(_))));
+        // Other users have their own limit; root has none.
+        assert!(checks.begin_for_user(1001).is_ok());
+        for _ in 0..100 {
+            assert!(checks.begin_for_user(0).is_ok());
+        }
+        checks.end_for_user(1000);
+        assert!(checks.begin_for_user(1000).is_ok());
+        for _ in 0..64 {
+            checks.end_for_user(1000);
+        }
+        checks.end_for_user(1001);
+        assert!(checks.by_user.is_empty());
     }
 
     #[test]

@@ -6,6 +6,10 @@
 //! - `unix-process`: the process is pinned by a pidfd (the client's, or one opened here and checked
 //!   against `start-time`); the uid is its real uid.
 //! - `unix-session`: the session and its user, from logind.
+//!
+//! Errors may name other users' processes and uids: the caller logs them and answers a generic
+//! refusal. Reads of `/proc` and of the user database (NSS) run as blocking tasks, off the bus
+//! executor.
 
 use crate::decision::Session;
 use crate::logind;
@@ -25,9 +29,17 @@ pub struct Identified {
     pub session: Session,
 }
 
-/// The uid and the pinned process of a bus connection, as the bus knows them
-/// (`GetConnectionCredentials`), never as the peer says.
-async fn bus_peer(connection: &Connection, name: &str) -> Result<(u32, Process), String> {
+/// How the client pins the process of a `unix-process` subject.
+enum Pin {
+    /// The client's pidfd.
+    Pidfd(OwnedFd),
+    /// The start time the client read; the daemon opens the pidfd itself.
+    StartTime(u64),
+}
+
+/// The uid and the pidfd of a bus connection, as the bus knows them (`GetConnectionCredentials`),
+/// never as the peer says.
+async fn bus_peer(connection: &Connection, name: &str) -> Result<(u32, OwnedFd), String> {
     let credentials = credentials(connection, name).await?;
     let uid = credentials
         .unix_user_id()
@@ -39,7 +51,7 @@ async fn bus_peer(connection: &Connection, name: &str) -> Result<(u32, Process),
         .as_fd()
         .try_clone_to_owned()
         .map_err(|error| error.to_string())?;
-    Ok((uid, Process::from_pidfd(pidfd)?))
+    Ok((uid, pidfd))
 }
 
 /// The uid of a bus connection, as the bus knows it.
@@ -74,41 +86,26 @@ pub async fn identify(
             if !name.starts_with(':') {
                 return Err(format!("{name:?} is not a unique bus name"));
             }
-            let (uid, process) = bus_peer(connection, &name).await?;
-            process_subject(connection, uid, process).await
+            let (uid, pidfd) = bus_peer(connection, &name).await?;
+            let (process, cgroup) = blocking::unblock(move || {
+                let process = Process::from_pidfd(pidfd)?;
+                let cgroup = process.cgroup()?;
+                Ok::<_, String>((process, cgroup))
+            })
+            .await?;
+            process_subject(connection, uid, process, &cgroup).await
         }
         "unix-process" => {
             let pid: u32 = detail(details, "pid")?;
-            let process = match details.get("pidfd") {
-                Some(value) => {
-                    let process = Process::from_pidfd(fd_of(value)?)?;
-                    if process.pid() != pid {
-                        return Err(format!("pid {pid} is not the pidfd's process"));
-                    }
-                    process
-                }
-                None => {
-                    let start_time: u64 = detail(details, "start-time")?;
-                    let process = Process::open(pid)?;
-                    // 0: the client never pinned the process, so it may not be the one it meant.
-                    if start_time == 0 || process.start_time()? != start_time {
-                        return Err(format!(
-                            "process {pid}: the start time does not match (PID reused or not given)"
-                        ));
-                    }
-                    process
-                }
+            let pin = match details.get("pidfd") {
+                Some(value) => Pin::Pidfd(fd_of(value)?),
+                None => Pin::StartTime(detail(details, "start-time")?),
             };
-            let uid = process.real_uid()?;
             // The uid the client saw, when it sends one (-1: it did not know).
-            if let Some(seen) = optional_uid(details)? {
-                if seen != uid {
-                    return Err(format!(
-                        "process {pid}: its user changed from {seen} to {uid}"
-                    ));
-                }
-            }
-            process_subject(connection, uid, process).await
+            let seen_uid = optional_uid(details)?;
+            let (process, uid, cgroup) =
+                blocking::unblock(move || read_unix_process(pid, pin, seen_uid)).await?;
+            process_subject(connection, uid, process, &cgroup).await
         }
         "unix-session" => {
             let id: String = detail(details, "session-id")?;
@@ -122,15 +119,53 @@ pub async fn identify(
     }
 }
 
+/// Pins the process of a `unix-process` subject and reads its real uid and its cgroup. Blocking
+/// (`/proc`): call it as a blocking task.
+fn read_unix_process(
+    pid: u32,
+    pin: Pin,
+    seen_uid: Option<u32>,
+) -> Result<(Process, u32, String), String> {
+    let process = match pin {
+        Pin::Pidfd(pidfd) => {
+            let process = Process::from_pidfd(pidfd)?;
+            if process.pid() != pid {
+                return Err(format!("pid {pid} is not the pidfd's process"));
+            }
+            process
+        }
+        Pin::StartTime(start_time) => {
+            let process = Process::open(pid)?;
+            // 0: the client never pinned the process, so it may not be the one it meant.
+            if start_time == 0 || process.start_time()? != start_time {
+                return Err(format!(
+                    "process {pid}: the start time does not match (PID reused or not given)"
+                ));
+            }
+            process
+        }
+    };
+    let uid = process.real_uid()?;
+    if let Some(seen) = seen_uid {
+        if seen != uid {
+            return Err(format!(
+                "process {pid}: its user changed from {seen} to {uid}"
+            ));
+        }
+    }
+    let cgroup = process.cgroup()?;
+    Ok((process, uid, cgroup))
+}
+
 /// The session of a pinned process of user `uid`; everything is read before the last check that
-/// the process is still alive.
+/// the process is still alive (a poll that does not wait, so not a blocking task).
 async fn process_subject(
     connection: &Connection,
     uid: u32,
     process: Process,
+    cgroup: &str,
 ) -> Result<Identified, String> {
-    let cgroup = process.cgroup()?;
-    let session = logind::session_of_process(connection, process.pid(), uid, &cgroup).await?;
+    let session = logind::session_of_process(connection, process.pid(), uid, cgroup).await?;
     process.ensure_alive()?;
     Ok(Identified { uid, session })
 }
@@ -170,7 +205,17 @@ fn fd_of(value: &OwnedValue) -> Result<OwnedFd, String> {
     }
 }
 
-/// The user's name and the names of all their groups, from the user database (NSS).
+/// The user's name, from the user database (NSS); `None` when it has none or cannot be read.
+/// Blocking: call it as a blocking task.
+pub fn user_name(uid: u32) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|user| user.name)
+}
+
+/// The user's name and the names of all their groups, from the user database (NSS). Blocking: call
+/// it as a blocking task.
 pub fn user_and_groups(uid: u32) -> Result<(String, Vec<String>), String> {
     use nix::unistd::{Group, Uid, User, getgrouplist};
     let user = User::from_uid(Uid::from_raw(uid))

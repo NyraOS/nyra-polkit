@@ -3,7 +3,7 @@
 //!
 //! Only `NoSessionForPID` means "no session". Any other failure (logind unreachable, a timeout, an
 //! unexpected reply) is an error, which denies the check: it must never fall back to `allow_any`
-//! (docs/DESIGN.md, "Subjects").
+//! (docs/DESIGN.md, "Subjects"). The timeout is the bus connection's (`CALL_TIMEOUT` in main.rs).
 
 use crate::decision::Session;
 use crate::process::is_under_user_manager;
@@ -68,8 +68,9 @@ pub async fn session_by_id(connection: &Connection, id: &str) -> Result<SessionI
     session_at(connection, path).await
 }
 
-/// The session state of a process of user `uid`, whose cgroup is `cgroup`. A process in no session
-/// gets its user's display session only when it runs under that user's service manager.
+/// The session state of a process of user `uid`, whose cgroup is `cgroup`. A process in another
+/// user's session is not local, unless it is root's. A process in no session gets its user's
+/// display session only when it runs under that user's service manager.
 pub async fn session_of_process(
     connection: &Connection,
     pid: u32,
@@ -78,7 +79,16 @@ pub async fn session_of_process(
 ) -> Result<Session, String> {
     let manager = manager(connection).await?;
     match manager.get_session_by_pid(pid).await {
-        Ok(path) => return Ok(session_at(connection, path).await?.state),
+        Ok(path) => {
+            let session = session_at(connection, path).await?;
+            // `su` or `sudo -u` in the terminal of whoever sits at the seat leaves that user's
+            // process in the seat's session, while the user may be logged in only remotely
+            // (docs/DESIGN.md, "Subjects"). Root keeps the state: `sudo` at the seat.
+            if session.uid != uid && uid != 0 {
+                return Ok(Session::NotLocal);
+            }
+            return Ok(session.state);
+        }
         Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == NO_SESSION_FOR_PID => {}
         Err(error) => return Err(format!("logind, session of process {pid}: {error}")),
     }

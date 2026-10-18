@@ -29,8 +29,10 @@ jobs:
       - run: cargo +1.85 test --locked --workspace
 
   # nyra-polkitd on a private system-like bus, as root in Debian 13: its dbus-daemon gives
-  # ProcessFD, its pkcheck is a client, and its polkitd package creates the polkitd user the daemon
-  # runs as. Debian's own Rust (1.85) builds it.
+  # ProcessFD, its pkcheck and busctl are clients, and its polkitd package creates the polkitd user
+  # the daemon runs as. Debian's own Rust (1.85) builds it. Privileged, for a writable
+  # /sys/fs/cgroup: a test puts a process under a user's service manager (user@<uid>.service). The
+  # job has no secrets and a read-only token.
   integration:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
@@ -38,11 +40,12 @@ jobs:
     container:
       # debian:trixie, pinned by its multi-arch index digest.
       image: debian:trixie@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5
+      options: --privileged
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: apt-get update -q && apt-get install -qy --no-install-recommends ca-certificates cargo rustc dbus-daemon polkitd
+      - run: apt-get update -q && apt-get install -qy --no-install-recommends ca-certificates cargo rustc dbus-daemon polkitd systemd
       - run: cargo test --locked --test dbus -- --ignored
 
   deny:

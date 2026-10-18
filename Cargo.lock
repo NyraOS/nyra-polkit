@@ -403,7 +403,9 @@ name = "nyra-polkitd"
 version = "0.1.0"
 dependencies = [
  "async-channel",
+ "async-io",
  "async-signal",
+ "blocking",
  "futures-lite",
  "nix",
  "roxmltree",

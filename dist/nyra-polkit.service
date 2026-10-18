@@ -31,6 +31,11 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
 SystemCallErrorNumber=EPERM
 
+# Threads, besides the limits on checks in flight: the daemon needs a few; past the bound a thread
+# is refused and the work waits for one already running. No MemoryMax=: one call from any user may
+# need about 250 MB for a moment (docs/DESIGN.md, "Limits"), and an OOM kill would stop every check.
+TasksMax=64
+
 # A read-only view of the system, nothing of the users' files.
 ProtectSystem=strict
 ProtectHome=yes

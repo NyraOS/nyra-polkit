@@ -4,9 +4,12 @@
 //! the test on the same bus, so each process can be put in any session. Clients: zbus and Debian's
 //! `pkcheck`.
 //!
-//! Needs root (to create rule files owned by root and to run processes as other users),
-//! `dbus-daemon`, `pkcheck`, `setpriv` and the users `polkitd` and `nobody`: the integration job
-//! of CI runs them in a Debian 13 container with `cargo test --test dbus -- --ignored`.
+//! Needs root (to create rule files owned by root and to run processes as other users), a writable
+//! `/sys/fs/cgroup` (to put a process under a user's service manager), `dbus-daemon`, `pkcheck`,
+//! `busctl`, `setpriv` and the users `polkitd` and `nobody`: the integration job of CI runs them in
+//! a privileged Debian 13 container with `cargo test --test dbus -- --ignored`.
+//!
+//! Every wait has a timeout, so a regression fails the test instead of hanging the job.
 
 use futures_lite::StreamExt;
 use nyra_polkitd::process::Process;
@@ -14,7 +17,7 @@ use std::collections::HashMap;
 use std::fs::{File, Permissions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::fdo::DBusProxy;
@@ -56,6 +59,23 @@ const ACTIONS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
       <allow_active>yes</allow_active>
     </defaults>
   </action>
+  <action id="org.nyra.test.owned">
+    <annotate key="org.freedesktop.policykit.owner">unix-user:42</annotate>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+  <!-- Without "unix-user:", 42 names nobody. -->
+  <action id="org.nyra.test.owned-bare">
+    <annotate key="org.freedesktop.policykit.owner">42</annotate>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
   <action id="org.nyra.test.challenge">
     <defaults>
       <allow_any>auth_admin_keep</allow_any>
@@ -90,17 +110,22 @@ const RULED: &str = "org.nyra.test.ruled";
 const DENIED: &str = "org.nyra.test.denied";
 const CHALLENGE: &str = "org.nyra.test.challenge";
 const UNKNOWN: &str = "org.nyra.test.unknown";
+const OWNED: &str = "org.nyra.test.owned";
+const OWNED_BARE: &str = "org.nyra.test.owned-bare";
 
 type Answer = (bool, bool, HashMap<String, String>);
 const YES: (bool, bool) = (true, false);
 const NO: (bool, bool) = (false, false);
 const CHALLENGED: (bool, bool) = (false, true);
 
-// pkcheck(1) exit codes.
+// pkcheck(1) exit codes; an error (127) is checked through the D-Bus error it prints.
 const PKCHECK_AUTHORIZED: i32 = 0;
 const PKCHECK_NOT_AUTHORIZED: i32 = 1;
 const PKCHECK_CHALLENGE: i32 = 2;
-const PKCHECK_ERROR: i32 = 127;
+
+/// How long any wait of the tests may take. Longer than the daemon's own timeout on logind (10 s),
+/// so that one is seen; short enough that a hang fails well before the job's timeout.
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 // --- The fake logind ---------------------------------------------------------------------------
 
@@ -126,6 +151,12 @@ enum ByPid {
     Fail,
     /// Never answers; tells the test when the call arrives.
     Hang(async_channel::Sender<()>),
+    /// Tells the test when the call arrives, then answers this session once the test releases it.
+    Delayed {
+        arrived: async_channel::Sender<()>,
+        release: async_channel::Receiver<()>,
+        session: &'static str,
+    },
 }
 
 #[derive(Default)]
@@ -160,14 +191,23 @@ struct FakeManager(Arc<Mutex<LogindState>>);
 impl FakeManager {
     #[zbus(name = "GetSessionByPID")]
     async fn get_session_by_pid(&self, pid: u32) -> Result<OwnedObjectPath, LogindError> {
-        let hang = match self.0.lock().unwrap().by_pid.get(&pid) {
+        let (arrived, release) = match self.0.lock().unwrap().by_pid.get(&pid) {
             None => return Err(LogindError::NoSessionForPID(format!("{pid}"))),
             Some(ByPid::Session(id)) => return Ok(session_path(id)),
             Some(ByPid::Fail) => return Err(LogindError::Broken("logind failed".into())),
-            Some(ByPid::Hang(arrived)) => arrived.clone(),
+            Some(ByPid::Hang(arrived)) => (arrived.clone(), None),
+            Some(ByPid::Delayed {
+                arrived,
+                release,
+                session,
+            }) => (arrived.clone(), Some((release.clone(), *session))),
         };
-        hang.send(()).await.unwrap();
-        futures_lite::future::pending().await
+        arrived.send(()).await.unwrap();
+        let Some((release, session)) = release else {
+            return futures_lite::future::pending().await;
+        };
+        release.recv().await.unwrap();
+        Ok(session_path(session))
     }
 
     async fn get_session(&self, id: String) -> Result<OwnedObjectPath, LogindError> {
@@ -263,11 +303,30 @@ fn make_directory(path: &Path) {
 }
 
 fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + TIMEOUT;
     while !done() {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// `future`, or a failed test once [`TIMEOUT`] has passed.
+async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
+    let timeout = async {
+        async_io::Timer::after(TIMEOUT).await;
+        panic!("timed out waiting for {what}");
+    };
+    futures_lite::future::or(future, timeout).await
+}
+
+/// A client connection to the test bus, whose calls time out.
+async fn connect(address: &str) -> Connection {
+    zbus::connection::Builder::address(address)
+        .unwrap()
+        .method_timeout(TIMEOUT)
+        .build()
+        .await
+        .unwrap()
 }
 
 impl Harness {
@@ -362,11 +421,7 @@ impl Harness {
             .spawn()
             .expect("setpriv");
 
-        let client = zbus::connection::Builder::address(address.as_str())
-            .unwrap()
-            .build()
-            .await
-            .unwrap();
+        let client = connect(&address).await;
         let mut harness = Self {
             directory,
             address,
@@ -376,7 +431,7 @@ impl Harness {
             logind_state,
             client,
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + TIMEOUT;
         while !harness.name_is_owned().await {
             assert!(
                 harness.daemon.try_wait().unwrap().is_none(),
@@ -425,6 +480,25 @@ impl Harness {
         self.logind_state.lock().unwrap().by_pid.insert(pid, answer);
     }
 
+    async fn call_check(
+        &self,
+        subject: &Subject,
+        action: &str,
+        details: HashMap<&str, &str>,
+        flags: u32,
+        cancellation_id: &str,
+    ) -> zbus::Result<zbus::Message> {
+        self.client
+            .call_method(
+                Some(NAME),
+                PATH,
+                Some(INTERFACE),
+                "CheckAuthorization",
+                &(subject, action, details, flags, cancellation_id),
+            )
+            .await
+    }
+
     async fn check_with(
         &self,
         subject: &Subject,
@@ -434,19 +508,25 @@ impl Harness {
         cancellation_id: &str,
     ) -> Result<Answer, String> {
         let reply = self
-            .client
-            .call_method(
-                Some(NAME),
-                PATH,
-                Some(INTERFACE),
-                "CheckAuthorization",
-                &(subject, action, details, flags, cancellation_id),
-            )
+            .call_check(subject, action, details, flags, cancellation_id)
             .await
             .map_err(error_name)?;
         // One struct, as polkit's client library expects.
         assert_eq!(reply.body().signature().to_string(), "(bba{ss})");
         Ok(reply.body().deserialize::<Answer>().unwrap())
+    }
+
+    /// The error a check is refused with: its name and its message.
+    async fn refusal(&self, subject: &Subject, action: &str) -> (String, String) {
+        match self
+            .call_check(subject, action, HashMap::new(), 0, "")
+            .await
+        {
+            Err(zbus::Error::MethodError(name, message, _)) => {
+                (name.to_string(), message.unwrap_or_default())
+            }
+            other => panic!("not refused: {other:?}"),
+        }
     }
 
     /// The answer, without its details, or the error's name.
@@ -456,8 +536,8 @@ impl Harness {
             .map(|(authorized, challenge, _)| (authorized, challenge))
     }
 
-    /// Runs a client (pkcheck) on the test bus, as `user` or as root; its exit code.
-    fn run(&self, user: Option<&str>, program: &str, arguments: &[&str]) -> i32 {
+    /// Runs a client on the test bus, as `user` (a name or a uid) or as root.
+    fn run(&self, user: Option<&str>, program: &str, arguments: &[&str]) -> Output {
         let mut command = Command::new("setpriv");
         match user {
             Some(user) => command.args([
@@ -470,34 +550,60 @@ impl Harness {
             ]),
             None => command.arg("--reuid=0"),
         };
-        let output = command
+        // pkcheck and busctl give up after 25 s by themselves.
+        command
             .arg("--")
             .arg(program)
             .args(arguments)
             .env("DBUS_SYSTEM_BUS_ADDRESS", &self.address)
             .stdin(Stdio::null())
             .output()
-            .expect("setpriv");
-        output.status.code().unwrap_or_else(|| {
-            panic!(
-                "{program} {arguments:?}: {}, {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            )
-        })
+            .expect("setpriv")
     }
 
-    fn pkcheck(&self, action: &str, process: &str) -> i32 {
-        self.run(
-            None,
-            "pkcheck",
-            &["--action-id", action, "--process", process],
-        )
+    /// Runs pkcheck as `user` or as root: see [`pkcheck_answer`].
+    fn pkcheck_as(&self, user: Option<&str>, arguments: &[&str]) -> Result<i32, String> {
+        pkcheck_answer(self.run(user, "pkcheck", arguments))
+    }
+
+    fn pkcheck(&self, action: &str, process: &str) -> Result<i32, String> {
+        self.pkcheck_as(None, &["--action-id", action, "--process", process])
+    }
+
+    async fn cancel(&self, cancellation_id: &str) -> Result<(), String> {
+        self.client
+            .call_method(
+                Some(NAME),
+                PATH,
+                Some(INTERFACE),
+                "CancelCheckAuthorization",
+                &(cancellation_id),
+            )
+            .await
+            .map(|_| ())
+            .map_err(error_name)
     }
 
     fn reload(&self) {
         let pid = rustix::process::Pid::from_raw(self.daemon.id() as i32).unwrap();
         rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
+    }
+}
+
+/// pkcheck's exit code (0, 1 or 2), or for an error (127) the D-Bus error it printed. A 127
+/// without one (a shell's "command not found" is 127 too) or any other exit fails the test.
+fn pkcheck_answer(output: Output) -> Result<i32, String> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    match output.status.code() {
+        Some(code @ (PKCHECK_AUTHORIZED | PKCHECK_NOT_AUTHORIZED | PKCHECK_CHALLENGE)) => Ok(code),
+        Some(127) => {
+            let error = stderr
+                .split_once("GDBus.Error:")
+                .and_then(|(_, rest)| rest.split_once(':'))
+                .map(|(name, _)| name.to_string());
+            Err(error.unwrap_or_else(|| panic!("pkcheck failed without a D-Bus error: {stderr}")))
+        }
+        _ => panic!("pkcheck: {}, {stderr}", output.status),
     }
 }
 
@@ -510,6 +616,7 @@ fn error_name(error: zbus::Error) -> String {
 
 const NOT_AUTHORIZED: &str = "org.freedesktop.PolicyKit1.Error.NotAuthorized";
 const FAILED: &str = "org.freedesktop.PolicyKit1.Error.Failed";
+const CANCELLED: &str = "org.freedesktop.PolicyKit1.Error.Cancelled";
 
 type Subject = (&'static str, HashMap<&'static str, Value<'static>>);
 
@@ -575,6 +682,43 @@ fn me() -> u32 {
     std::process::id()
 }
 
+/// A pidfd for a process, as a client opens it.
+fn pidfd(pid: u32) -> std::os::fd::OwnedFd {
+    let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).unwrap()
+}
+
+/// A `unix-process` subject pinned by the client's pidfd, as recent client libraries send it.
+fn unix_process_with_pidfd(pid: u32, pidfd: std::os::fd::OwnedFd) -> Subject {
+    (
+        "unix-process",
+        HashMap::from([("pid", Value::U32(pid)), ("pidfd", Value::Fd(pidfd.into()))]),
+    )
+}
+
+/// Sends a check of `subject` for DEFAULT without waiting for its answer.
+async fn send_check(connection: &Connection, subject: &Subject) {
+    let message = zbus::Message::method_call(PATH, "CheckAuthorization")
+        .unwrap()
+        .destination(NAME)
+        .unwrap()
+        .interface(INTERFACE)
+        .unwrap()
+        .build(&(subject, DEFAULT, HashMap::<&str, &str>::new(), 0u32, ""))
+        .unwrap();
+    connection.send(&message).await.unwrap();
+}
+
+/// Waits until `count` calls have arrived at the fake logind.
+async fn arrivals(at_logind: &async_channel::Receiver<()>, count: usize) {
+    within("calls to logind", async {
+        for _ in 0..count {
+            at_logind.recv().await.unwrap();
+        }
+    })
+    .await;
+}
+
 // --- The tests ---------------------------------------------------------------------------------
 
 #[test]
@@ -599,11 +743,11 @@ fn answers_from_rules_and_defaults_for_every_subject_kind() {
         }
 
         let pid = me().to_string();
-        assert_eq!(bus.pkcheck(DEFAULT, &pid), PKCHECK_AUTHORIZED);
-        assert_eq!(bus.pkcheck(RULED, &pid), PKCHECK_AUTHORIZED);
-        assert_eq!(bus.pkcheck(DENIED, &pid), PKCHECK_NOT_AUTHORIZED);
-        assert_eq!(bus.pkcheck(CHALLENGE, &pid), PKCHECK_CHALLENGE);
-        assert_eq!(bus.pkcheck(UNKNOWN, &pid), PKCHECK_NOT_AUTHORIZED);
+        assert_eq!(bus.pkcheck(DEFAULT, &pid), Ok(PKCHECK_AUTHORIZED));
+        assert_eq!(bus.pkcheck(RULED, &pid), Ok(PKCHECK_AUTHORIZED));
+        assert_eq!(bus.pkcheck(DENIED, &pid), Ok(PKCHECK_NOT_AUTHORIZED));
+        assert_eq!(bus.pkcheck(CHALLENGE, &pid), Ok(PKCHECK_CHALLENGE));
+        assert_eq!(bus.pkcheck(UNKNOWN, &pid), Ok(PKCHECK_NOT_AUTHORIZED));
     });
 }
 
@@ -662,15 +806,150 @@ fn the_session_from_logind_picks_the_default() {
 
         assert_eq!(
             bus.pkcheck(DEFAULT, &no_session.pid().to_string()),
-            PKCHECK_NOT_AUTHORIZED
+            Ok(PKCHECK_NOT_AUTHORIZED)
         );
         assert_eq!(
             bus.pkcheck(DEFAULT, &inactive.pid().to_string()),
-            PKCHECK_CHALLENGE
+            Ok(PKCHECK_CHALLENGE)
         );
         assert_eq!(
             bus.pkcheck(DEFAULT, &failing.pid().to_string()),
-            PKCHECK_ERROR
+            Err(NOT_AUTHORIZED.to_string())
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn another_users_session_is_not_local() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("foreign-session", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        let nobody_session = FakeSession {
+            uid: 65534,
+            ..LOCAL_ACTIVE
+        };
+        bus.add_session("c2", nobody_session).await;
+
+        // `su nobody` in a terminal of root's session at the seat: not local, allow_any ("no").
+        let nobody_in_roots = Sleeper::start(Some("nobody"));
+        bus.place(nobody_in_roots.pid(), ByPid::Session("c1"));
+        assert_eq!(
+            bus.check(&unix_process(nobody_in_roots.pid()), DEFAULT)
+                .await,
+            Ok(NO)
+        );
+        // In nobody's own session, it is.
+        let nobody_in_own = Sleeper::start(Some("nobody"));
+        bus.place(nobody_in_own.pid(), ByPid::Session("c2"));
+        assert_eq!(
+            bus.check(&unix_process(nobody_in_own.pid()), DEFAULT).await,
+            Ok(YES)
+        );
+        // root keeps the session it is in: `sudo` at the seat.
+        let root_in_nobodys = Sleeper::start(None);
+        bus.place(root_in_nobodys.pid(), ByPid::Session("c2"));
+        assert_eq!(
+            bus.check(&unix_process(root_in_nobodys.pid()), DEFAULT)
+                .await,
+            Ok(YES)
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn a_logind_that_never_answers_is_a_refusal() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("logind-timeout", "").await;
+        let stuck = Sleeper::start(None);
+        let (arrived, _at_logind) = async_channel::bounded(1);
+        bus.place(stuck.pid(), ByPid::Hang(arrived));
+        // The daemon's timeout (10 s) answers, before the client's own (TIMEOUT) would.
+        assert_eq!(
+            bus.check(&unix_process(stuck.pid()), DEFAULT).await,
+            Err(NOT_AUTHORIZED.to_string())
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root, dbus-daemon and a writable /sys/fs/cgroup: run by the integration job"]
+fn the_display_session_counts_under_the_users_own_manager() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("display", "").await;
+        let nobody_session = FakeSession {
+            uid: 65534,
+            ..LOCAL_ACTIVE
+        };
+        bus.add_session("c2", nobody_session).await;
+        bus.add_user_with_display(65534, "c2").await;
+
+        // An app that nobody's `systemd --user` started: in no session, but in nobody's
+        // user@65534.service, so it gets nobody's display session.
+        let user_slice = Path::new("/sys/fs/cgroup/user.slice");
+        let manager = user_slice.join("user-65534.slice/user@65534.service");
+        std::fs::create_dir_all(&manager).expect("a writable /sys/fs/cgroup (see the top)");
+        let app = Sleeper::start(Some("nobody"));
+        std::fs::write(manager.join("cgroup.procs"), app.pid().to_string()).unwrap();
+        assert_eq!(bus.check(&unix_process(app.pid()), DEFAULT).await, Ok(YES));
+        // The same user elsewhere (cron, a system service) has no session.
+        let elsewhere = Sleeper::start(Some("nobody"));
+        assert_eq!(
+            bus.check(&unix_process(elsewhere.pid()), DEFAULT).await,
+            Ok(NO)
+        );
+
+        drop(app);
+        for cgroup in [
+            &manager,
+            &manager.parent().unwrap().to_path_buf(),
+            &user_slice.to_path_buf(),
+        ] {
+            let _ = std::fs::remove_dir(cgroup);
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn a_subject_that_exits_while_logind_answers_is_refused() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("exits", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        let bus = &bus;
+        // logind answers c1 (allow_active, "yes") only after the test has killed the subject, or
+        // not.
+        let check_while_logind_waits = |kill: bool| async move {
+            let mut subject_process = Some(Sleeper::start(None));
+            let pid = subject_process.as_ref().unwrap().pid();
+            let (arrived, at_logind) = async_channel::bounded(1);
+            let (released, release) = async_channel::bounded(1);
+            bus.place(
+                pid,
+                ByPid::Delayed {
+                    arrived,
+                    release,
+                    session: "c1",
+                },
+            );
+            let subject = unix_process(pid);
+            let checking = bus.check(&subject, DEFAULT);
+            let meanwhile = async {
+                arrivals(&at_logind, 1).await;
+                if kill {
+                    subject_process.take();
+                }
+                released.send(()).await.unwrap();
+            };
+            futures_lite::future::zip(checking, meanwhile).await.0
+        };
+        // Still alive: the answer stands.
+        assert_eq!(check_while_logind_waits(false).await, Ok(YES));
+        // Gone before logind answered: its PID may already be another process's.
+        assert_eq!(
+            check_while_logind_waits(true).await,
+            Err(NOT_AUTHORIZED.to_string())
         );
     });
 }
@@ -700,12 +979,18 @@ fn subjects_that_cannot_be_pinned_are_refused() {
             bus.check(&unix_process_with(me(), 0, None), DEFAULT).await,
             refused
         );
-        // The client saw another user.
+        // The client saw another user. The caller only learns that the subject was not
+        // identified; the journal has the reason.
         assert_eq!(
-            bus.check(&unix_process_with(me(), start_time, Some(4242)), DEFAULT)
+            bus.refusal(&unix_process_with(me(), start_time, Some(4242)), DEFAULT)
                 .await,
-            refused
+            (
+                NOT_AUTHORIZED.to_string(),
+                "cannot identify the subject".to_string()
+            )
         );
+        let log = bus.log();
+        assert!(log.contains("its user changed from 4242 to 0"), "{log}");
         // A process that is gone.
         let gone = Sleeper::start(None);
         let subject = unix_process(gone.pid());
@@ -723,7 +1008,21 @@ fn subjects_that_cannot_be_pinned_are_refused() {
         );
         assert_eq!(
             bus.pkcheck(DEFAULT, &format!("{},{}", me(), start_time + 1)),
-            PKCHECK_ERROR
+            Err(NOT_AUTHORIZED.to_string())
+        );
+
+        // A pidfd from the client pins the process: no start time needed. Its PID must be the
+        // subject's.
+        assert_eq!(
+            bus.check(&unix_process_with_pidfd(me(), pidfd(me())), DEFAULT)
+                .await,
+            Ok(YES)
+        );
+        let other = Sleeper::start(None);
+        assert_eq!(
+            bus.check(&unix_process_with_pidfd(me(), pidfd(other.pid())), DEFAULT)
+                .await,
+            refused
         );
 
         // Only AllowUserInteraction (1) is a flag.
@@ -754,25 +1053,65 @@ fn other_users_subjects_and_polkit_details() {
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
         assert_eq!(bus.check(&subject, RULED).await, Ok(NO));
 
-        // Another user may not check root's process.
+        // Another user may not check root's subjects: a process, a bus name or a session.
+        let refused = Err(NOT_AUTHORIZED.to_string());
         let root_pid = me().to_string();
-        let as_nobody = |arguments: &[&str]| bus.run(Some("nobody"), "pkcheck", arguments);
+        let root_name = bus.client.unique_name().unwrap().to_string();
+        let as_nobody = |arguments: &[&str]| bus.pkcheck_as(Some("nobody"), arguments);
         assert_eq!(
             as_nobody(&["--action-id", DEFAULT, "--process", &root_pid]),
-            PKCHECK_ERROR
+            refused
         );
+        assert_eq!(
+            as_nobody(&["--action-id", DEFAULT, "--system-bus-name", &root_name]),
+            refused
+        );
+        // pkcheck has no unix-session subjects: busctl sends one.
+        let session_as_nobody = |id: &str| {
+            let output = bus.run(
+                Some("nobody"),
+                "busctl",
+                &[
+                    "call",
+                    NAME,
+                    PATH,
+                    INTERFACE,
+                    "CheckAuthorization",
+                    "(sa{sv})sa{ss}us",
+                    "unix-session",
+                    "1",
+                    "session-id",
+                    "s",
+                    id,
+                    DEFAULT,
+                    "0",
+                    "0",
+                    "",
+                ],
+            );
+            (
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+        let (code, answer, _) = session_as_nobody("c2");
+        assert_eq!((code, answer.trim()), (Some(0), "(bba{ss}) true false 0"));
+        let (code, _, error) = session_as_nobody("c1");
+        assert_eq!(code, Some(1));
+        assert!(
+            error.contains("only root may check the authorization of another user's subject"),
+            "{error}"
+        );
+
         // But it may check itself (no session: allow_any, "no").
         let itself = format!("exec pkcheck --action-id {DEFAULT} --process $$");
-        assert_eq!(
-            bus.run(Some("nobody"), "sh", &["-c", &itself]),
-            PKCHECK_NOT_AUTHORIZED
-        );
+        let run_as_nobody =
+            |script: &str| pkcheck_answer(bus.run(Some("nobody"), "sh", &["-c", script]));
+        assert_eq!(run_as_nobody(&itself), Ok(PKCHECK_NOT_AUTHORIZED));
         // polkit.* details: only the documented ones, and only from root.
         let with_detail = format!("{itself} --detail polkit.message hello");
-        assert_eq!(
-            bus.run(Some("nobody"), "sh", &["-c", &with_detail]),
-            PKCHECK_ERROR
-        );
+        assert_eq!(run_as_nobody(&with_detail), Err(FAILED.to_string()));
         let me_subject = unix_process(me());
         let detail = |key| bus.check_with(&me_subject, DEFAULT, HashMap::from([(key, "x")]), 0, "");
         assert!(detail("polkit.message").await.is_ok());
@@ -780,6 +1119,33 @@ fn other_users_subjects_and_polkit_details() {
         assert_eq!(
             detail("polkit.retains_authorization_after_challenge").await,
             Err(FAILED.to_string())
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn the_owner_annotation_lets_a_user_check_others() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("owner", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.place(me(), ByPid::Session("c1"));
+        let root_pid = me().to_string();
+        let as_42 =
+            |action| bus.pkcheck_as(Some("42"), &["--action-id", action, "--process", &root_pid]);
+
+        // "unix-user:42": uid 42 gets root's answer (allow_active, "yes").
+        assert_eq!(as_42(OWNED), Ok(PKCHECK_AUTHORIZED));
+        // A bare "42" is not an identity; nor does the annotation of one action open another.
+        assert_eq!(as_42(OWNED_BARE), Err(NOT_AUTHORIZED.to_string()));
+        assert_eq!(as_42(DEFAULT), Err(NOT_AUTHORIZED.to_string()));
+        // Other users still may not.
+        assert_eq!(
+            bus.pkcheck_as(
+                Some("nobody"),
+                &["--action-id", OWNED, "--process", &root_pid]
+            ),
+            Err(NOT_AUTHORIZED.to_string())
         );
     });
 }
@@ -799,7 +1165,7 @@ fn broken_rules_deny_everything_until_a_reload_fixes_them() {
         }
         assert_eq!(
             bus.pkcheck(DEFAULT, &me().to_string()),
-            PKCHECK_NOT_AUTHORIZED
+            Ok(PKCHECK_NOT_AUTHORIZED)
         );
         assert!(bus.name_is_owned().await);
         let log = bus.log();
@@ -821,14 +1187,17 @@ fn broken_rules_deny_everything_until_a_reload_fixes_them() {
         // Fixed, then reloaded: normal answers.
         write_trusted(&bus.directory.join("local/90-local.toml"), "# fixed\n");
         bus.reload();
-        changes.next().await.unwrap().unwrap();
+        within("Changed", changes.next()).await.unwrap().unwrap();
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
-        assert_eq!(bus.pkcheck(DEFAULT, &me().to_string()), PKCHECK_AUTHORIZED);
+        assert_eq!(
+            bus.pkcheck(DEFAULT, &me().to_string()),
+            Ok(PKCHECK_AUTHORIZED)
+        );
 
         // Broken again by a reload: denied again, still owning the name.
         write_trusted(&bus.directory.join("local/90-local.toml"), BROKEN_RULES);
         bus.reload();
-        changes.next().await.unwrap().unwrap();
+        within("Changed", changes.next()).await.unwrap().unwrap();
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(NO));
         assert!(bus.name_is_owned().await);
     });
@@ -867,7 +1236,7 @@ fn actions_properties_and_cancellation() {
             .unwrap();
         let actions: Vec<Description> = reply.body().deserialize().unwrap();
         let ids: Vec<&str> = actions.iter().map(|action| action.0.as_str()).collect();
-        assert_eq!(ids, [CHALLENGE, DEFAULT, DENIED, RULED]);
+        assert_eq!(ids, [CHALLENGE, DEFAULT, DENIED, OWNED, OWNED_BARE, RULED]);
         let default = &actions[1];
         assert_eq!(default.1, "Fă lucrul implicit");
         assert_eq!(default.2, "Authentication is required");
@@ -894,21 +1263,7 @@ fn actions_properties_and_cancellation() {
             &Value::from(env!("CARGO_PKG_VERSION"))
         );
 
-        let bus = &bus;
-        let cancel = |id: &'static str| async move {
-            bus.client
-                .call_method(
-                    Some(NAME),
-                    PATH,
-                    Some(INTERFACE),
-                    "CancelCheckAuthorization",
-                    &(id),
-                )
-                .await
-                .map(|_| ())
-                .map_err(error_name)
-        };
-        assert_eq!(cancel("nothing").await, Err(FAILED.to_string()));
+        assert_eq!(bus.cancel("nothing").await, Err(FAILED.to_string()));
 
         // A check that waits on logind, cancelled while it waits.
         let slow = Sleeper::start(None);
@@ -918,7 +1273,7 @@ fn actions_properties_and_cancellation() {
         let me_subject = unix_process(me());
         let waiting = bus.check_with(&slow_subject, DEFAULT, HashMap::new(), 0, "c");
         let meanwhile = async {
-            at_logind.recv().await.unwrap();
+            arrivals(&at_logind, 1).await;
             let again = bus
                 .check_with(&me_subject, DEFAULT, HashMap::new(), 0, "c")
                 .await;
@@ -926,18 +1281,234 @@ fn actions_properties_and_cancellation() {
                 again.map(|_| ()),
                 Err("org.freedesktop.PolicyKit1.Error.CancellationIdNotUnique".to_string())
             );
-            cancel("c").await
+            bus.cancel("c").await
         };
         let (cancelled, cancelling) = futures_lite::future::zip(waiting, meanwhile).await;
         assert_eq!(cancelling, Ok(()));
-        assert_eq!(
-            cancelled.map(|_| ()),
-            Err("org.freedesktop.PolicyKit1.Error.Cancelled".to_string())
-        );
+        assert_eq!(cancelled.map(|_| ()), Err(CANCELLED.to_string()));
         // The id is free again.
         let again = bus
             .check_with(&me_subject, DEFAULT, HashMap::new(), 0, "c")
             .await;
         assert_eq!(again.map(|(authorized, _, _)| authorized), Ok(true));
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn two_cancellable_checks_from_one_caller() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("two-cancellable", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.place(me(), ByPid::Session("c1"));
+        let slow = Sleeper::start(None);
+        let (arrived, at_logind) = async_channel::bounded(1);
+        bus.place(slow.pid(), ByPid::Hang(arrived));
+        let slow_subject = unix_process(slow.pid());
+        let me_subject = unix_process(me());
+        let check = |subject, id| bus.check_with(subject, DEFAULT, HashMap::new(), 0, id);
+
+        let second = check(&slow_subject, "b");
+        let the_rest = async {
+            let first = check(&slow_subject, "a");
+            let cancel_first = async {
+                arrivals(&at_logind, 2).await;
+                assert_eq!(bus.cancel("a").await, Ok(()));
+            };
+            let (first, ()) = futures_lite::future::zip(first, cancel_first).await;
+            assert_eq!(first.map(|_| ()), Err(CANCELLED.to_string()));
+            // "a" is free again while "b" still waits, and "b" can still be cancelled.
+            let again = check(&me_subject, "a").await;
+            assert_eq!(again.map(|(authorized, _, _)| authorized), Ok(true));
+            assert_eq!(bus.cancel("b").await, Ok(()));
+        };
+        let (second, ()) = futures_lite::future::zip(second, the_rest).await;
+        assert_eq!(second.map(|_| ()), Err(CANCELLED.to_string()));
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn the_limit_per_connection_holds_and_root_has_no_limit_per_user() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("limits-root", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.place(me(), ByPid::Session("c1"));
+        let slow = Sleeper::start(None);
+        let (arrived, at_logind) = async_channel::bounded(1);
+        bus.place(slow.pid(), ByPid::Hang(arrived));
+        let slow_subject = unix_process(slow.pid());
+        let me_subject = unix_process(me());
+
+        // 32 checks wait on one connection: a 33rd is refused at once.
+        let first = connect(&bus.address).await;
+        for _ in 0..32 {
+            send_check(&first, &slow_subject).await;
+        }
+        arrivals(&at_logind, 32).await;
+        let on_first = first
+            .call_method(
+                Some(NAME),
+                PATH,
+                Some(INTERFACE),
+                "CheckAuthorization",
+                &(&me_subject, DEFAULT, HashMap::<&str, &str>::new(), 0u32, ""),
+            )
+            .await
+            .map(|_| ())
+            .map_err(error_name);
+        assert_eq!(on_first, Err(FAILED.to_string()));
+        // Another connection has its own 32.
+        let second = connect(&bus.address).await;
+        for _ in 0..32 {
+            send_check(&second, &slow_subject).await;
+        }
+        arrivals(&at_logind, 32).await;
+        // Root's connections are the system services': 64 checks of root in flight do not stop a
+        // third one.
+        assert_eq!(bus.check(&me_subject, DEFAULT).await, Ok(YES));
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn a_user_has_at_most_64_checks_in_flight() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("limits-user", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.place(me(), ByPid::Session("c1"));
+        let slow = Sleeper::start(Some("nobody"));
+        let (arrived, at_logind) = async_channel::bounded(1);
+        bus.place(slow.pid(), ByPid::Hang(arrived));
+        let slow_pid = slow.pid().to_string();
+        let pkcheck_slow = ["--action-id", DEFAULT, "--process", &slow_pid];
+
+        // 64 checks of nobody wait on logind, each from its own pkcheck (its own connection).
+        let mut waiting: Vec<Child> = (0..64)
+            .map(|_| {
+                Command::new("setpriv")
+                    .args(["--reuid=nobody", "--regid=nogroup", "--clear-groups", "--"])
+                    .arg("pkcheck")
+                    .args(pkcheck_slow)
+                    .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect();
+        arrivals(&at_logind, 64).await;
+        // A 65th, from yet another connection, is refused at once.
+        assert_eq!(
+            bus.pkcheck_as(Some("nobody"), &pkcheck_slow),
+            Err(FAILED.to_string())
+        );
+        // Other users are not affected.
+        assert_eq!(bus.check(&unix_process(me()), DEFAULT).await, Ok(YES));
+        for pkcheck in &mut waiting {
+            let _ = pkcheck.kill();
+            let _ = pkcheck.wait();
+        }
+    });
+}
+
+/// The daemon's process in a cgroup with the memory settings of the unit in `dist/`: its
+/// `MemoryMax=` (none: no limit) and no swap, as on a machine without swap. The memory controller
+/// is only given to the children of a cgroup without processes, so the container's processes move
+/// to a child cgroup first; dropping this takes the controller back and moves them back, leaving
+/// the container's cgroups as they were.
+struct UnitMemoryCgroup {
+    others: PathBuf,
+    daemon: PathBuf,
+}
+
+/// Moves every process of the cgroup `from` to `to` until `done` (processes may start meanwhile);
+/// false if it never is. Does not panic: it also runs while a failed test unwinds.
+fn move_processes(from: &Path, to: &Path, done: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + TIMEOUT;
+    while Instant::now() < deadline {
+        let processes = std::fs::read_to_string(from.join("cgroup.procs")).unwrap_or_default();
+        for process in processes.lines() {
+            let _ = std::fs::write(to.join("cgroup.procs"), process);
+        }
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+
+impl UnitMemoryCgroup {
+    fn place(pid: u32) -> Self {
+        let root = Path::new(CGROUP_ROOT);
+        let others = root.join("nyra-polkit-tests");
+        std::fs::create_dir_all(&others).expect("a writable /sys/fs/cgroup (see the top)");
+        let emptied = move_processes(root, &others, || {
+            std::fs::write(root.join("cgroup.subtree_control"), "+memory").is_ok()
+        });
+        assert!(emptied, "the memory controller for the daemon's cgroup");
+
+        let unit = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../dist/nyra-polkit.service"),
+        )
+        .unwrap();
+        let memory_max = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("MemoryMax="))
+            .unwrap_or("max");
+        let daemon = root.join("nyra-polkitd");
+        std::fs::create_dir_all(&daemon).unwrap();
+        std::fs::write(daemon.join("memory.max"), memory_max).unwrap();
+        std::fs::write(daemon.join("memory.swap.max"), "0").unwrap();
+        std::fs::write(daemon.join("cgroup.procs"), pid.to_string()).unwrap();
+        Self { others, daemon }
+    }
+
+    /// The most memory the daemon has used.
+    fn peak(&self) -> String {
+        std::fs::read_to_string(self.daemon.join("memory.peak")).unwrap_or_default()
+    }
+}
+
+impl Drop for UnitMemoryCgroup {
+    fn drop(&mut self) {
+        let root = Path::new(CGROUP_ROOT);
+        let _ = std::fs::write(root.join("cgroup.subtree_control"), "-memory");
+        move_processes(&self.daemon, root, || {
+            std::fs::remove_dir(&self.daemon).is_ok()
+        });
+        move_processes(&self.others, root, || {
+            std::fs::remove_dir(&self.others).is_ok()
+        });
+    }
+}
+
+#[test]
+#[ignore = "needs root, dbus-daemon and a writable /sys/fs/cgroup: run by the integration job"]
+fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
+    futures_lite::future::block_on(async {
+        let mut bus = Harness::start("large-call", "").await;
+        bus.add_session("c1", LOCAL_ACTIVE).await;
+        bus.place(me(), ByPid::Session("c1"));
+        let cgroup = UnitMemoryCgroup::place(bus.daemon.id());
+        let subject = unix_process(me());
+
+        // About 31 MiB of details (24 bytes each on the wire), under the bus's 32 MiB per message:
+        // turned into Rust values, they take far more.
+        let names: Vec<String> = (0..1_350_000).map(|i| format!("{i:x}")).collect();
+        let details: HashMap<&str, &str> = names.iter().map(|name| (name.as_str(), "")).collect();
+        let large = bus.check_with(&subject, DEFAULT, details, 0, "").await;
+        eprintln!("the daemon's peak memory: {} bytes", cgroup.peak().trim());
+        assert_eq!(large.map(|(authorized, _, _)| authorized), Ok(true));
+        // The same daemon still answers.
+        assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
+        assert!(bus.daemon.try_wait().unwrap().is_none(), "{}", bus.log());
+
+        drop(bus);
+        drop(cgroup);
     });
 }
