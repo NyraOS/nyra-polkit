@@ -39,9 +39,11 @@ pub enum Subject {
     SystemBusName(String),
 }
 
-/// The options in the order given, without the program name. `--help` and `--version` win over
-/// everything else, then `--list-temp`, then `--revoke-temp`, as with Debian's pkcheck; any
-/// malformed option is an error even with them.
+/// The options in the order given, without the program name. Among `--help`, `--version`,
+/// `--list-temp` and `--revoke-temp`, the first in that order wins, as with Debian's pkcheck. Next
+/// to any option of a check they are malformed: Debian's pkcheck then exits with 0 without asking
+/// the authority, which a script would read as "authorized". Any malformed option is an error even
+/// with them.
 pub fn parse(arguments: Vec<String>) -> Result<Command, String> {
     let mut help = false;
     let mut version = false;
@@ -78,23 +80,39 @@ pub fn parse(arguments: Vec<String>) -> Result<Command, String> {
                 let (Some(key), Some(detail)) = (arguments.next(), arguments.next()) else {
                     return Err("Two arguments expected after `--detail, -d'".to_string());
                 };
+                // Rules match on details: with two values, which one was meant cannot be known.
+                if details.contains_key(&key) {
+                    return Err(format!(
+                        "Only one --detail with the key `{key}' may be given"
+                    ));
+                }
                 details.insert(key, detail);
             }
             _ => return Err(format!("Unexpected argument `{argument}'")),
         }
     }
 
-    if help {
-        return Ok(Command::Help);
-    }
-    if version {
-        return Ok(Command::Version);
-    }
-    if list_temporary {
-        return Ok(Command::ListTemporary);
-    }
-    if revoke_temporary {
-        return Ok(Command::RevokeTemporary);
+    let other = if help {
+        Some((Command::Help, "--help"))
+    } else if version {
+        Some((Command::Version, "--version"))
+    } else if list_temporary {
+        Some((Command::ListTemporary, "--list-temp"))
+    } else if revoke_temporary {
+        Some((Command::RevokeTemporary, "--revoke-temp"))
+    } else {
+        None
+    };
+    if let Some((command, option)) = other {
+        let part_of_a_check = action_id.is_some()
+            || subject.is_some()
+            || !details.is_empty()
+            || allow_user_interaction
+            || enable_internal_agent;
+        if part_of_a_check {
+            return Err(format!("{option} cannot be combined with a check"));
+        }
+        return Ok(command);
     }
     let subject = subject.ok_or("Subject not specified")?;
     let action_id = action_id.ok_or("Action not specified")?;
@@ -415,13 +433,58 @@ mod tests {
             Ok(Command::ListTemporary)
         );
         assert_eq!(parse_args(&["--revoke-temp"]), Ok(Command::RevokeTemporary));
+    }
+
+    #[test]
+    fn help_version_and_temporary_authorizations_are_not_part_of_a_check() {
+        // Each option of a check, next to each of the four: never an exit code of 0 that the
+        // authority did not give.
+        let check_options: [&[&str]; 6] = [
+            &["-a", "x"],
+            &["-p", "1"],
+            &["-s", ":1.0"],
+            &["-d", "k", "v"],
+            &["-u"],
+            &["--enable-internal-agent"],
+        ];
+        for other in ["--help", "-h", "--version", "--list-temp", "--revoke-temp"] {
+            let named = if other == "-h" { "--help" } else { other };
+            for check_option in check_options {
+                for arguments in [
+                    [check_option, &[other]].concat(),
+                    [&[other], check_option].concat(),
+                ] {
+                    assert_eq!(
+                        parse_args(&arguments),
+                        Err(format!("{named} cannot be combined with a check")),
+                        "{arguments:?}"
+                    );
+                }
+            }
+            let whole_check = ["-a", "x", "-p", "1", other];
+            assert!(parse_args(&whole_check).is_err(), "{whole_check:?}");
+        }
+        // The one that wins is named.
         assert_eq!(
-            parse_args(&["-a", "x", "-p", "1", "--revoke-temp"]),
-            Ok(Command::RevokeTemporary)
+            parse_args(&["--revoke-temp", "--list-temp", "-u"]),
+            Err("--list-temp cannot be combined with a check".to_string())
         );
+    }
+
+    #[test]
+    fn a_detail_key_is_given_once() {
         assert_eq!(
-            parse_args(&["--list-temp", "-a", "x"]),
-            Ok(Command::ListTemporary)
+            parse_args(&[
+                "-a", "x", "-p", "1", "-d", "remote", "a", "-d", "remote", "b"
+            ]),
+            Err("Only one --detail with the key `remote' may be given".to_string())
         );
+        // Even with the same value: a caller that repeats a key has made a mistake.
+        assert_eq!(
+            parse_args(&["-a", "x", "-p", "1", "-d", "k", "v", "--detail", "k", "v"]),
+            Err("Only one --detail with the key `k' may be given".to_string())
+        );
+        let details = check(&["-a", "x", "-p", "1", "-d", "k", "v", "-d", "K", "v"]).details;
+        assert_eq!(details.len(), 2);
     }
 }

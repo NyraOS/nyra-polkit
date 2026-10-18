@@ -67,7 +67,8 @@ cargo build --release -p nyra-pkcheck   # target/release/pkcheck
 ```
 
 Nothing installs it yet; it replaces polkit's `pkcheck` (`/usr/bin/pkcheck`) once nyra-polkitd
-replaces polkitd.
+replaces polkitd. It reads `DBUS_SYSTEM_BUS_ADDRESS`, so it must never be setuid, and a
+privileged process must not run it with an environment inherited from an unprivileged one.
 
 ## Building
 

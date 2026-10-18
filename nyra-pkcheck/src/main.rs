@@ -273,6 +273,9 @@ fn unix_process(pinned: &Pinned) -> SubjectValue<'_> {
 }
 
 /// pkcheck(1)'s output of details: bytes other than `[a-zA-Z0-9_]` as `\` and their octal value.
+/// Not padded to three digits (`,` is `\54`), as in pkcheck(1)'s example and Debian's output, so
+/// scripts that decode it keep working; a digit after a short escape is ambiguous to a reader, but
+/// no byte can add a line or an `=`.
 fn escape(text: &str) -> String {
     let mut escaped = String::new();
     for byte in text.bytes() {
@@ -363,31 +366,42 @@ async fn list_temporary() -> u8 {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    for (id, action, subject, obtained, expires) in authorizations {
-        println!(
-            "{id}: {action} for {}, obtained {} s ago, expires in {} s",
-            describe_subject(&subject),
-            now.saturating_sub(obtained),
-            expires.saturating_sub(now)
-        );
+    for authorization in &authorizations {
+        println!("{}", describe_authorization(authorization, now));
     }
     AUTHORIZED
+}
+
+/// One line of `--list-temp`. The authority's strings are escaped as details are, so none can add
+/// a line or look like another field.
+fn describe_authorization(
+    (id, action, subject, obtained, expires): &TemporaryAuthorization,
+    now: u64,
+) -> String {
+    format!(
+        "{}: {} for {}, obtained {} s ago, expires in {} s",
+        escape(id),
+        escape(action),
+        describe_subject(subject),
+        now.saturating_sub(*obtained),
+        expires.saturating_sub(now)
+    )
 }
 
 /// A subject as `kind key=value ...`, keys sorted.
 fn describe_subject((kind, details): &(String, HashMap<String, OwnedValue>)) -> String {
     let mut keys: Vec<&String> = details.keys().collect();
     keys.sort();
-    let mut text = kind.clone();
+    let mut text = escape(kind);
     for key in keys {
         let value = match &*details[key] {
-            Value::Str(text) => text.to_string(),
+            Value::Str(text) => escape(text),
             Value::U32(number) => number.to_string(),
             Value::U64(number) => number.to_string(),
             Value::I32(number) => number.to_string(),
             _ => "?".to_string(),
         };
-        text.push_str(&format!(" {key}={value}"));
+        text.push_str(&format!(" {}={value}", escape(key)));
     }
     text
 }
@@ -508,16 +522,29 @@ mod tests {
         ]);
         assert_eq!(
             describe_subject(&("unix-process".to_string(), details)),
-            "unix-process pid=42 start-time=4242 uid=-1"
+            r"unix\55process pid=42 start\55time=4242 uid=-1"
         );
         let session = HashMap::from([(
             "session-id".to_string(),
-            OwnedValue::try_from(Value::from("c7")).unwrap(),
+            OwnedValue::try_from(Value::from("c7\nx=y")).unwrap(),
         )]);
-        assert_eq!(
-            describe_subject(&("unix-session".to_string(), session)),
-            "unix-session session-id=c7"
+        let authorization = (
+            "tmp\nauthz0".to_string(),
+            "org.example.act".to_string(),
+            ("unix-session".to_string(), session),
+            1000,
+            1300,
         );
+        assert_eq!(
+            describe_authorization(&authorization, 1010),
+            r"tmp\12authz0: org\56example\56act for unix\55session session\55id=c7\12x\75y, obtained 10 s ago, expires in 290 s"
+        );
+        // A clock that went back or an authorization already expired: no wrap around.
+        assert!(
+            describe_authorization(&authorization, 900)
+                .ends_with("obtained 0 s ago, expires in 400 s")
+        );
+        assert!(describe_authorization(&authorization, 2000).ends_with("expires in 0 s"));
     }
 
     #[test]

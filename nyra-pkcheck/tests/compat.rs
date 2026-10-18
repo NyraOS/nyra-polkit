@@ -575,6 +575,18 @@ fn where_ours_refuses_and_debians_guesses() {
         vec!["-a", RULED, "-a", RULED, "-p", &pid],
         vec!["-a", RULED, "-p", &pid, "-p", &pid],
         vec!["-a", RULED, "-p", &pid, "-s", ":1.0"],
+        // Two values for one detail: rules match on details.
+        vec!["-a", RULED, "-p", &pid, "-d", "k", "a", "-d", "k", "b"],
+        // A check next to an option that does something else: no exit code the authority did
+        // not give.
+        vec!["-a", DENIED, "-p", &pid, "--help"],
+        vec!["-a", DENIED, "-p", &pid, "--version"],
+        vec!["-a", DENIED, "-p", &pid, "--list-temp"],
+        vec!["-a", DENIED, "-p", &pid, "--revoke-temp"],
+        vec!["--version", "-u"],
+        vec!["--list-temp", "-d", "k", "v"],
+        vec!["--revoke-temp", "--enable-internal-agent"],
+        vec!["--help", "-s", ":1.0"],
     ] {
         let output = answer(bus.run(None, None, OURS, &args));
         assert_eq!(output.code, 126, "{args:?}: {}", output.stderr);
@@ -585,6 +597,19 @@ fn where_ours_refuses_and_debians_guesses() {
         );
         assert_eq!(output.stdout, "", "{args:?}");
     }
+    // What Debian's pkcheck answers there: 0, for an action that is denied or a detail it
+    // dropped, without asking the authority (docs/DESIGN.md, "pkcheck").
+    let denied_with = |option| ["-a", DENIED, "-p", &pid, option].map(String::from);
+    for args in [denied_with("--help"), denied_with("--version")] {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        assert_eq!(
+            answer(bus.run(None, None, "pkcheck", &args)).code,
+            0,
+            "{args:?}"
+        );
+    }
+    let repeated = ["-a", RULED, "-p", &pid, "-d", "k", "a", "-d", "k", "b"];
+    assert_eq!(answer(bus.run(None, None, "pkcheck", &repeated)).code, 0);
 }
 
 #[test]

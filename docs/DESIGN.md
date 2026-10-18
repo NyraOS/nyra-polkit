@@ -323,8 +323,9 @@ and exit codes of pkcheck(1). The integration tests run it next to Debian 13's `
 | `--version`, `--help`, `-h` | |
 
 As with Debian's pkcheck, each value is its own argument (no `--option=value`, no `--`, no grouped
-one-letter options), anything else is "Unexpected argument", and `--help`, `--version`,
-`--list-temp`, `--revoke-temp` win, in that order, over a check.
+one-letter options) and anything else is "Unexpected argument". Of `--help`, `--version`,
+`--list-temp` and `--revoke-temp`, the first in that order wins; next to an option of a check they
+are malformed (below).
 
 **The process is pinned.** `--process` opens a pidfd for the PID and reads, under it, the start
 time and the real uid; a start time or uid given by the caller must be the process's, or pkcheck
@@ -334,8 +335,10 @@ takes a pidfd (nyra-polkitd) uses it, and one that does not (Debian's polkitd, o
 start time. `--system-bus-name` takes only unique names.
 
 **Output.** The details of the answer go to standard output as `KEY=VALUE` lines, keys sorted, with
-every byte outside `[a-zA-Z0-9_]` written as `\` and its octal value, as pkcheck(1) shows.
-Diagnostics go to standard error, worded as Debian's pkcheck words them.
+every byte outside `[a-zA-Z0-9_]` written as `\` and its octal value, as pkcheck(1) shows. The
+octal value is not padded (`,` is `\54`), as in pkcheck(1)'s example and Debian's output: a digit
+after a short escape is ambiguous to a reader, but no byte can add a line or an `=`. Diagnostics go
+to standard error, worded as Debian's pkcheck words them.
 
 | Exit code | When |
 |---|---|
@@ -354,7 +357,7 @@ session's processes in `session-<id>.scope` directly under their user's slice
 too. Outside one, both print `Error getting session: No session for pid <pid>` and exit with 1.
 The subject sent is that `unix-session`. pkcheck(1) does not define the listing; ours is one line
 per authorization: `<id>: <action> for <subject kind> <key>=<value>..., obtained <n> s ago,
-expires in <m> s`.
+expires in <m> s`, with the authority's strings escaped as details are.
 
 **`--enable-internal-agent`** would need a text authentication agent inside pkcheck, which would
 need the protocol of `polkit-agent-helper-1`; it is not documented, so pkcheck does not have one.
@@ -370,6 +373,12 @@ the case for services and scripts.
   PID 1, uses the first three of `1,2,3,4`, and sends `-5` or `0` to the authority.
 - A second `--action-id`, or a second subject (`--process` or `--system-bus-name`), is malformed:
   which one was meant cannot be known. Debian's pkcheck uses the last one.
+- A `--detail` key given twice is malformed: rules match on details, and which value was meant
+  cannot be known. Debian's pkcheck accepts it.
+- `--help`, `--version`, `--list-temp` or `--revoke-temp` next to an option of a check (`-a`, `-p`,
+  `-s`, `-d`, `-u`, `--enable-internal-agent`) is malformed (126). Debian's pkcheck does the other
+  thing and exits with 0 without asking the authority, observed even for an action that is denied:
+  a script that runs `if pkcheck ...` would take that for "authorized".
 - No `--action-id` is malformed (126); Debian's pkcheck fails a GLib assertion and exits with 127.
 - A bus name that is not unique is "Invalid --system-bus-name value" (126); Debian's pkcheck says
   "Subject not specified" (126).
@@ -379,6 +388,12 @@ the case for services and scripts.
   (127, as with Debian's, whose authority refuses it), with a message of our own.
 - `--help` has its own text; a malformed option never shows the manual page, even on a terminal.
   `--version` prints `pkcheck version <version> (nyra-polkit)`.
+
+**Never setuid.** pkcheck connects to the bus named by `DBUS_SYSTEM_BUS_ADDRESS` when it is set (so
+the tests can use a private bus), and the authority answers whoever answers there. It must never be
+installed setuid or setgid, and a privileged process must not run it with an environment it took
+from an unprivileged one: a caller could then point it at a bus of its own, with an "authority"
+that says yes to everything.
 
 ## Security
 
