@@ -100,6 +100,8 @@ has a tarball per architecture, `nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz` and
 - `dist/`: the systemd unit, the D-Bus policy and activation file and the sysusers file, each
   naming where it is installed in its first lines;
 - `LICENSE`, `README.md`, `SECURITY.md`;
+- `Cargo.lock`: the lock file the binaries were built with (`--locked`), for listing the exact crates
+  and versions in an SBOM;
 - `third-party/`: the licence files of every crate built into the binaries, and `CRATES`, their
   list with versions and licences.
 
