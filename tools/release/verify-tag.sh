@@ -21,11 +21,25 @@ if [ "$(git rev-parse "refs/tags/$tag^{commit}")" != "$commit" ]; then
   exit 1
 fi
 
+# Only OpenPGP and SSH signatures: an X.509 one would be checked by gpgsm against the machine's
+# certificate authorities. git reads the signature from the last such line of the tag.
+signature=$(git cat-file tag "$tag" | grep -- '^-----BEGIN ' | tail -n 1 || true)
+case $signature in
+  "-----BEGIN PGP SIGNATURE-----" | "-----BEGIN SSH SIGNATURE-----") ;;
+  *)
+    echo "verify-tag.sh: $tag has no OpenPGP or SSH signature" >&2
+    exit 1
+    ;;
+esac
+
 keys=$(mktemp -d)
 trap 'rm -rf "$keys"' EXIT
-# Only the maintainers' keys: an empty keyring and an allowed-signers file of our own.
+# Only the maintainers' keys: an empty keyring and an allowed-signers file of our own. The
+# machine's own GnuPG configuration still applies, so verifying must not add keys either; the
+# fingerprint check below does not depend on any of it.
 export GNUPGHOME="$keys/gnupg"
 mkdir -m 700 "$GNUPGHOME"
+printf '%s\n' no-auto-key-retrieve no-auto-key-import >"$GNUPGHOME/gpg.conf"
 touch "$keys/allowed_signers"
 key_count=0
 
@@ -48,7 +62,27 @@ if [ "$key_count" -eq 0 ]; then
   exit 1
 fi
 
-# git picks SSH or GPG from the signature itself; it fails on an unsigned tag, a bad signature or
-# a key that is not one of the above.
-git -c gpg.ssh.allowedSignersFile="$keys/allowed_signers" verify-tag "$tag"
+# The primary-key fingerprints of the maintainers' GPG keys, before anything else can touch the
+# keyring.
+gpg --batch --with-colons --list-keys |
+  awk -F: '$1 == "pub" { primary = 1; next } $1 == "fpr" && primary { print $10; primary = 0 }' \
+    >"$keys/fingerprints"
+
+# git fails on an unsigned tag, a bad signature or, for SSH, a key not in the allowed-signers
+# file. --raw writes gpg's status lines (or ssh-keygen's output) to standard error.
+git -c gpg.ssh.allowedSignersFile="$keys/allowed_signers" -c gpg.x509.program=false \
+  verify-tag --raw "$tag" 2>"$keys/status" || {
+  cat "$keys/status" >&2
+  echo "verify-tag.sh: the signature on $tag does not verify" >&2
+  exit 1
+}
+# For OpenPGP, every valid signature must be made by one of the maintainers' keys (VALIDSIG's last
+# field is the signing key's primary-key fingerprint), whatever gpg was configured to accept.
+if [ "$signature" = "-----BEGIN PGP SIGNATURE-----" ]; then
+  awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print $NF }' "$keys/status" >"$keys/signers"
+  if [ ! -s "$keys/signers" ] || grep -qvxFf "$keys/fingerprints" "$keys/signers"; then
+    echo "verify-tag.sh: $tag is not signed by a maintainer's GPG key" >&2
+    exit 1
+  fi
+fi
 echo "verify-tag.sh: $tag is signed by a maintainer"

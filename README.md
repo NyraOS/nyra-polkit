@@ -124,7 +124,11 @@ It stops at the first check that fails:
 1. **The tag is signed by a maintainer.** It fetches the tag `vX.Y.Z` from GitHub and runs
    `git verify-tag` with only the public signing keys that the logins in
    [`.github/MAINTAINERS`](.github/MAINTAINERS) have registered on GitHub
-   ([`tools/release/verify-tag.sh`](tools/release/verify-tag.sh)). The tag must be annotated.
+   ([`tools/release/verify-tag.sh`](tools/release/verify-tag.sh)). The tag must be annotated and
+   signed with OpenPGP or SSH, and a GPG signature must name one of those keys' fingerprints, so
+   nothing in the machine's own GnuPG configuration (keys fetched or imported while verifying,
+   trusted X.509 authorities) can make another signature count. Check the signature with this
+   script rather than with a bare `git verify-tag`, which trusts whatever your GnuPG setup trusts.
 2. **The tag's commit is on `main`'s history** (`git merge-base --is-ancestor <commit> main`).
 3. **The tarball was built by the release workflow, from that tag and that commit:**
    ```sh
@@ -138,20 +142,6 @@ It stops at the first check that fails:
    - `--source-ref`: from the release's tag, not from a branch;
    - `--source-digest`: from the commit the signed tag points to;
    - `--deny-self-hosted-runners`: on a runner hosted by GitHub.
-
-To check the signature by hand instead, take the maintainers' keys from GitHub (`MrTuNNe` is the
-login in `.github/MAINTAINERS` today) and verify the tag with them:
-
-```sh
-git fetch origin tag vX.Y.Z
-# GPG keys, in an empty keyring of their own so no other key counts:
-export GNUPGHOME=$(mktemp -d)
-gh api users/MrTuNNe/gpg_keys --jq '.[].raw_key' | gpg --import
-git verify-tag vX.Y.Z
-# or SSH keys:
-gh api users/MrTuNNe/ssh_signing_keys --jq '.[].key' | sed 's/^/MrTuNNe /' >allowed_signers
-git -c gpg.ssh.allowedSignersFile=allowed_signers verify-tag vX.Y.Z
-```
 
 `.github/MAINTAINERS` says whose signature you trust: a change to it is a change of trust, and
 its history shows who made it.
