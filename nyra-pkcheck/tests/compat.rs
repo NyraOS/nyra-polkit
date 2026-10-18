@@ -336,10 +336,14 @@ fn without_numbers(text: &str) -> String {
 /// Debian's lines of GLib's own complaints (`** (pkcheck:42): CRITICAL **`) and the blank lines
 /// around them, which are not pkcheck's diagnostics.
 fn without_glib_noise(text: &str) -> String {
-    text.lines()
-        .filter(|line| !line.is_empty() && !line.starts_with("** (") && !line.starts_with('('))
-        .map(|line| format!("{line}\n"))
-        .collect()
+    let mut kept = String::new();
+    for line in text.lines() {
+        if !line.is_empty() && !line.starts_with("** (") && !line.starts_with('(') {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    kept
 }
 
 /// Runs Debian's pkcheck and ours with the same options; both must exit with `code`, print the
