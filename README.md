@@ -112,10 +112,10 @@ sha256sum -c --ignore-missing SHA256SUMS
 Then check where it came from. Your trust should rest on the maintainer's signature on the tag,
 which no access token can make, and not only on the release workflow: anyone holding a token that
 can push tags could also run a changed workflow. From a clone of this repository, with `git`,
-`gpg`, `ssh-keygen` and the [GitHub CLI](https://cli.github.com) 2.102 or newer, logged in
-(older versions lack or match more loosely the checks below, and Debian 13's gh 2.46 has no
-`attestation` command; [cli.github.com](https://cli.github.com) has packages for most
-distributions):
+GnuPG (`gpg`), OpenSSH (`ssh-keygen`) and the [GitHub CLI](https://cli.github.com) 2.102 or newer,
+logged in (older versions lack or match more loosely the checks below, and Debian 13's gh 2.46 has
+no `attestation` command; [cli.github.com](https://cli.github.com) has packages for most
+distributions; on macOS `brew install gnupg gh`):
 
 ```sh
 git clone https://github.com/NyraOS/nyra-polkit && cd nyra-polkit
