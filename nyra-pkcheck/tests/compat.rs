@@ -6,7 +6,7 @@
 //! session.
 //!
 //! Needs root, a writable `/sys/fs/cgroup` (to put pkcheck in a session's scope), `dbus-daemon`,
-//! Debian's `pkcheck`, `setpriv`, `setsid`, the users `polkitd` and `nobody`, and nyra-polkitd
+//! Debian's `pkcheck`, `setpriv`, `setsid`, `timeout`, the users `polkitd` and `nobody`, and nyra-polkitd
 //! built next to our pkcheck: the integration job of CI runs them in a privileged Debian 13
 //! container with `cargo test --test dbus --test compat -- --ignored`.
 //!
@@ -268,8 +268,9 @@ impl Harness {
     }
 
     /// Runs `program` (a pkcheck) on the test bus, as `user` or as root, in a new session of the
-    /// kernel's (setsid): without a controlling terminal, as a service runs it, so Debian's pkcheck
-    /// never prompts on the terminal of whoever runs the tests. With `cgroup`, pkcheck starts in it.
+    /// kernel's (setsid), without a controlling terminal, as a service runs it, so Debian's
+    /// pkcheck never prompts on the terminal of whoever runs the tests. With `cgroup`, pkcheck
+    /// starts in it. `timeout` gives it [`TIMEOUT`]: a pkcheck that hangs fails the test.
     fn run(
         &self,
         user: Option<&str>,
@@ -294,7 +295,9 @@ impl Harness {
             None => command.arg("--reuid=0"),
         };
         command
-            .args(["--", "setsid", "--wait", program])
+            .args(["--", "setsid", "--wait", "timeout"])
+            .arg(TIMEOUT.as_secs().to_string())
+            .arg(program)
             .args(args)
             .env("DBUS_SYSTEM_BUS_ADDRESS", &self.address)
             .stdin(Stdio::null())
