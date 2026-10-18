@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 [package]
 name = "nyra-polkitd"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 # The Rust in Debian 13 (trixie), so the daemon also builds with the distribution's compiler.
 rust-version = "1.85"
