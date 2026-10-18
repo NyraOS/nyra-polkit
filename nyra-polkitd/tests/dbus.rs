@@ -6,13 +6,17 @@
 //!
 //! Authentication agents are this test binary run again as another user ([`fake_agent_program`]):
 //! each registers with the daemon and passes every dialog on to the test (the "relay"), which plays
-//! the user and, as root, the helper that answers `AuthenticationAgentResponse2`.
+//! the user and, as root, the helper that answers `AuthenticationAgentResponse2`. One test runs the
+//! real stack instead ([`debians_agent_and_helper_check_real_passwords`]): Debian's `pkttyagent` in
+//! a pseudo-terminal, its setuid `polkit-agent-helper-1` and PAM, with test users it makes and
+//! gives random passwords.
 //!
 //! Needs root (to create rule files owned by root and to run processes as other users), a writable
 //! `/sys/fs/cgroup` (to put a process under a user's service manager), `dbus-daemon`, `pkcheck`,
-//! `busctl`, `setpriv`, `timeout` and the users `polkitd`, `nobody` and `daemon`: the integration
-//! job of CI runs them in a privileged Debian 13 container with
-//! `cargo test --test dbus -- --ignored`.
+//! `pkttyagent`, `busctl`, `setpriv`, `timeout`, `script`, `useradd`, `groupadd`, `chpasswd`, the
+//! users `polkitd`, `nobody` and `daemon`, and no system bus running (the helper only connects to
+//! the system bus's own address, so the test bus takes it): the integration job of CI runs them in a
+//! privileged Debian 13 container with `cargo test --test dbus -- --ignored`.
 //!
 //! Every wait has a timeout, so a regression fails the test instead of hanging the job.
 
@@ -20,8 +24,8 @@ use futures_lite::StreamExt;
 use nyra_polkitd::process::Process;
 use std::collections::HashMap;
 use std::fs::{File, Permissions};
-use std::io::{BufRead, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::io::{BufRead, Read, Write};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
@@ -340,6 +344,8 @@ struct Harness {
     logind: Connection,
     logind_state: Arc<Mutex<LogindState>>,
     client: Connection,
+    /// The bus also listens at [`SYSTEM_BUS_SOCKET`].
+    system_socket: bool,
 }
 
 impl Drop for Harness {
@@ -348,6 +354,9 @@ impl Drop for Harness {
         let _ = self.daemon.wait();
         let _ = self.bus.kill();
         let _ = self.bus.wait();
+        if self.system_socket {
+            let _ = std::fs::remove_file(SYSTEM_BUS_SOCKET);
+        }
         if std::thread::panicking() {
             eprintln!("--- nyra-polkitd log ---\n{}", self.log());
         }
@@ -394,6 +403,21 @@ async fn connect(address: &str) -> Connection {
 
 impl Harness {
     async fn start(test: &str, local_rules: &str) -> Self {
+        Self::start_listening(test, local_rules, false).await
+    }
+
+    /// The same, with the bus also at the system bus's own address ([`SYSTEM_BUS_SOCKET`]), for
+    /// the setuid helper. Only one test may do that, and only where no system bus runs.
+    async fn start_on_system_socket(test: &str, local_rules: &str) -> Self {
+        assert!(
+            !Path::new(SYSTEM_BUS_SOCKET).exists(),
+            "{SYSTEM_BUS_SOCKET} exists: a system bus may run here, and the test needs its address"
+        );
+        make_directory(Path::new(SYSTEM_BUS_SOCKET).parent().unwrap());
+        Self::start_listening(test, local_rules, true).await
+    }
+
+    async fn start_listening(test: &str, local_rules: &str, system_socket: bool) -> Self {
         assert!(
             nix::unistd::geteuid().is_root(),
             "the D-Bus integration tests need root (see the top of tests/dbus.rs)"
@@ -418,6 +442,7 @@ impl Harness {
             r#"<busconfig>
   <type>system</type>
   <listen>unix:path={socket}</listen>
+  {system_listen}
   <auth>EXTERNAL</auth>
   <policy context="default">
     <allow user="*"/>
@@ -446,6 +471,10 @@ impl Harness {
 </busconfig>
 "#,
             socket = socket.display(),
+            system_listen = match system_socket {
+                true => format!("<listen>unix:path={SYSTEM_BUS_SOCKET}</listen>"),
+                false => String::new(),
+            },
             policy = policy.display()
         );
         write_trusted(&directory.join("bus.conf"), &config);
@@ -495,6 +524,7 @@ impl Harness {
             logind,
             logind_state,
             client,
+            system_socket,
         };
         let deadline = Instant::now() + TIMEOUT;
         while !harness.name_is_owned().await {
@@ -2765,5 +2795,336 @@ fn a_check_sent_just_before_leaving_counts_nowhere() {
         );
         let log = bus.log();
         assert!(!log.contains("panicked"), "{log}");
+    });
+}
+
+// --- Debian's agent and helper -----------------------------------------------------------------
+
+/// Debian 13's `polkit-agent-helper-1` (polkit 126): installed setuid root, with no socket-activated
+/// service for it, and run by `libpolkit-agent-1` for each dialog (observed).
+const HELPER: &str = "/usr/lib/polkit-1/polkit-agent-helper-1";
+/// The system bus's own address. The setuid helper does not follow the agent's
+/// `DBUS_SYSTEM_BUS_ADDRESS` and connects here (observed: without a bus at this address it fails
+/// with "Error getting authority"), so the test bus listens here too.
+const SYSTEM_BUS_SOCKET: &str = "/run/dbus/system_bus_socket";
+const TEST_USER: &str = "nyra-test-user";
+const TEST_ADMIN: &str = "nyra-test-admin";
+const TEST_ADMINS: &str = "nyra-test-admins";
+
+/// Makes the user `name` if it does not exist (in `group` too, if given), and gives it a new random
+/// password, which is returned: no password is written in the repository or in a log.
+fn user_with_password(name: &str, group: Option<&str>) -> String {
+    let run = |program: &str, arguments: &[&str]| {
+        let status = Command::new(program).args(arguments).status().unwrap();
+        assert!(status.success(), "{program} {arguments:?}: {status}");
+    };
+    let exists = |database: &str, key: &str| {
+        let status = Command::new("getent")
+            .args([database, key])
+            .output()
+            .unwrap();
+        status.status.success()
+    };
+    if let Some(group) = group {
+        if !exists("group", group) {
+            run("groupadd", &[group]);
+        }
+    }
+    if !exists("passwd", name) {
+        let mut arguments = vec!["--no-create-home", "--user-group", name];
+        if let Some(group) = group {
+            arguments.extend(["--groups", group]);
+        }
+        run("useradd", &arguments);
+    }
+    let mut random = [0u8; 16];
+    rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty()).unwrap();
+    let password: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut chpasswd = Command::new("chpasswd")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(chpasswd.stdin.take().unwrap(), "{name}:{password}").unwrap();
+    assert!(chpasswd.wait().unwrap().success(), "chpasswd {name}");
+    password
+}
+
+fn uid_of(name: &str) -> u32 {
+    nix::unistd::User::from_name(name)
+        .unwrap()
+        .unwrap()
+        .uid
+        .as_raw()
+}
+
+/// Debian's `pkttyagent --process <pid>`, run as a user, in the pseudo-terminal that `script` gives
+/// it: what it shows on the terminal is read from `script`'s output, and what the user types is
+/// written to `script`'s input.
+struct TtyAgent {
+    script: Child,
+    keyboard: ChildStdin,
+    screen: Arc<Mutex<String>>,
+    /// How much of the screen the test has already looked at.
+    seen: usize,
+}
+
+impl TtyAgent {
+    /// Starts it and waits until it has registered.
+    fn start(bus: &Harness, user: &str, pid: u32) -> Self {
+        let registered = || bus.log().matches("authentication agent registered").count();
+        let before = registered();
+        let mut script = Command::new("setpriv")
+            .args([
+                &format!("--reuid={user}"),
+                &format!("--regid={user}"),
+                "--init-groups",
+                "--",
+            ])
+            .args(["script", "--quiet", "--flush", "--return", "--command"])
+            .arg(format!("exec pkttyagent --process {pid}"))
+            .arg("/dev/null")
+            .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("script");
+        let screen = Arc::new(Mutex::new(String::new()));
+        let mut output = script.stdout.take().unwrap();
+        let shown = screen.clone();
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 1024];
+            while let Ok(read @ 1..) = output.read(&mut buffer) {
+                let text = String::from_utf8_lossy(&buffer[..read]);
+                shown.lock().unwrap().push_str(&text);
+            }
+        });
+        let agent = Self {
+            keyboard: script.stdin.take().unwrap(),
+            script,
+            screen,
+            seen: 0,
+        };
+        wait_until("pkttyagent to register", || registered() > before);
+        agent
+    }
+
+    /// Waits until the terminal shows `text` after what the test has seen; what it showed up to
+    /// the end of `text`.
+    fn shows(&mut self, text: &str) -> String {
+        let deadline = Instant::now() + TIMEOUT;
+        loop {
+            let screen = self.screen.lock().unwrap().clone();
+            if let Some(at) = screen[self.seen..].find(text) {
+                let end = self.seen + at + text.len();
+                let shown = screen[self.seen..end].to_string();
+                self.seen = end;
+                return shown;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for pkttyagent to show {text:?}; it showed {:?}",
+                &screen[self.seen..]
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Waits for the password prompt, and for the terminal to stop echoing: only then does
+    /// pkttyagent read the password, so nothing typed earlier can be lost.
+    fn asks_for_password(&mut self) {
+        self.shows("Password: ");
+        let terminal = File::open(format!("/proc/{}/fd/0", self.pid())).unwrap();
+        wait_until("the terminal to stop echoing", || {
+            let modes = rustix::termios::tcgetattr(&terminal).unwrap().local_modes;
+            !modes.contains(rustix::termios::LocalModes::ECHO)
+        });
+    }
+
+    fn types(&mut self, text: &str) {
+        self.keyboard.write_all(text.as_bytes()).unwrap();
+        self.keyboard.flush().unwrap();
+    }
+
+    /// pkttyagent's PID: `script` runs it as its only child.
+    fn pid(&self) -> u32 {
+        let script = self.script.id();
+        let children = std::fs::read_to_string(format!("/proc/{script}/task/{script}/children"));
+        let pid = children.unwrap().trim().parse().unwrap();
+        let name = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+        assert_eq!(name, "pkttyagent\n");
+        pid
+    }
+}
+
+impl Drop for TtyAgent {
+    fn drop(&mut self) {
+        // Its terminal goes away with script, and pkttyagent with it (SIGHUP).
+        let _ = self.script.kill();
+        let _ = self.script.wait();
+        if std::thread::panicking() {
+            // The passwords are never on it: the terminal does not echo them.
+            eprintln!("--- pkttyagent ---\n{}", self.screen.lock().unwrap());
+        }
+    }
+}
+
+impl Harness {
+    /// Debian's `pkcheck` as root for the process `pid`, started without waiting for it.
+    fn start_pkcheck(&self, action: &str, pid: u32, interactive: bool) -> Child {
+        let pid = pid.to_string();
+        let mut arguments = vec!["--action-id", action, "--process", &pid];
+        if interactive {
+            arguments.push("--allow-user-interaction");
+        }
+        self.command(None, "pkcheck", &arguments)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("setpriv")
+    }
+}
+
+/// pkcheck's answer ([`pkcheck_answer`]) and the details it printed.
+fn pkcheck_finished(pkcheck: Child) -> (Result<i32, String>, String) {
+    let output = pkcheck.wait_with_output().unwrap();
+    let details = String::from_utf8_lossy(&output.stdout).into_owned();
+    (pkcheck_answer(output), details)
+}
+
+#[test]
+#[ignore = "needs root, dbus-daemon, Debian's polkit and no system bus: run by the integration job"]
+fn debians_agent_and_helper_check_real_passwords() {
+    futures_lite::future::block_on(async {
+        // Set up as Debian 13 ships it: the helper is setuid root.
+        let helper = std::fs::metadata(HELPER).expect(HELPER);
+        assert_eq!(
+            (helper.mode() & 0o7777, helper.uid()),
+            (0o4755, 0),
+            "{HELPER} is not setuid root"
+        );
+        let rules = format!("[administrators]\ngroups = [\"{TEST_ADMINS}\"]\n");
+        let bus = Harness::start_on_system_socket("real-agent", &rules).await;
+        let user_password = user_with_password(TEST_USER, None);
+        let admin_password = user_with_password(TEST_ADMIN, Some(TEST_ADMINS));
+        let (user, admin) = (uid_of(TEST_USER), uid_of(TEST_ADMIN));
+        let app = Sleeper::start(Some(TEST_USER));
+        let mut agent = TtyAgent::start(&bus, TEST_USER, app.pid());
+
+        // auth_self with the user's own password: the helper checked it with PAM and answered,
+        // as root, for the agent's user.
+        let pkcheck = bus.start_pkcheck(SELF, app.pid(), true);
+        agent.shows(&format!("==== AUTHENTICATING FOR {SELF} ===="));
+        let dialog = agent.shows(&format!("Authenticating as: {TEST_USER}"));
+        assert!(dialog.contains("Authenticate yourself"), "{dialog}");
+        agent.asks_for_password();
+        agent.types(&format!("{user_password}\n"));
+        agent.shows("==== AUTHENTICATION COMPLETE ====");
+        assert_eq!(pkcheck_finished(pkcheck).0, Ok(PKCHECK_AUTHORIZED));
+        bus.logged(&format!("authorized, as uid {user}"));
+
+        // A wrong password: PAM refuses it, the helper does not answer, and pkttyagent returns as
+        // usual, which is not an authentication.
+        let pkcheck = bus.start_pkcheck(SELF, app.pid(), true);
+        agent.asks_for_password();
+        agent.types("not the password\n");
+        agent.shows("pam_authenticate failed");
+        agent.shows("==== AUTHENTICATION FAILED ====");
+        assert_eq!(pkcheck_finished(pkcheck).0, Ok(PKCHECK_NOT_AUTHORIZED));
+        bus.logged("returned without an authentication");
+
+        // auth_admin: only administrators are offered, and the administrator's password works.
+        let pkcheck = bus.start_pkcheck(ADMIN, app.pid(), true);
+        let choice = agent.shows("Choose identity to authenticate as");
+        assert!(!choice.contains(TEST_USER), "{choice}");
+        let number = choice
+            .lines()
+            .find(|line| line.trim_end().ends_with(TEST_ADMIN))
+            .and_then(|line| line.trim().split_once('.'))
+            .map(|(number, _)| number.to_string())
+            .unwrap_or_else(|| panic!("{TEST_ADMIN} is not offered: {choice}"));
+        agent.shows(": ");
+        agent.types(&format!("{number}\n"));
+        agent.asks_for_password();
+        agent.types(&format!("{admin_password}\n"));
+        agent.shows("==== AUTHENTICATION COMPLETE ====");
+        assert_eq!(pkcheck_finished(pkcheck).0, Ok(PKCHECK_AUTHORIZED));
+        bus.logged(&format!("authorized, as uid {admin}"));
+
+        // auth_self_keep: kept, and the next check is authorized by it, without a dialog.
+        let pkcheck = bus.start_pkcheck(SELF_KEEP, app.pid(), true);
+        agent.asks_for_password();
+        agent.types(&format!("{user_password}\n"));
+        agent.shows("==== AUTHENTICATION COMPLETE ====");
+        let (answer, details) = pkcheck_finished(pkcheck);
+        assert_eq!(answer, Ok(PKCHECK_AUTHORIZED));
+        assert!(
+            details.contains("polkit\\56retains_authorization_after_challenge=true"),
+            "{details}"
+        );
+        let kept = details
+            .lines()
+            .find(|line| line.starts_with("polkit\\56temporary_authorization_id="))
+            .unwrap_or_else(|| panic!("not kept: {details}"))
+            .to_string();
+        let dialogs = bus.log().matches("through the agent of").count();
+        let (answer, details) = pkcheck_finished(bus.start_pkcheck(SELF_KEEP, app.pid(), false));
+        assert_eq!(answer, Ok(PKCHECK_AUTHORIZED));
+        assert_eq!(details.lines().collect::<Vec<_>>(), [kept.as_str()]);
+        assert_eq!(bus.log().matches("through the agent of").count(), dialogs);
+
+        // The caller cancels while the password is asked: the caller has its answer at once, and
+        // the agent gets CancelAuthentication. pkttyagent acts on it only once its read of the
+        // terminal ends; even the right password typed then authorizes nothing. After that it
+        // answers neither call and shows no other dialog, with Debian's polkitd too (observed), so
+        // a new agent takes over.
+        let subject = unix_process(app.pid());
+        let checking = bus.check_with(&subject, SELF, HashMap::new(), ALLOW, "real-cancel");
+        let cancelling = async {
+            let agent = blocking::unblock(move || {
+                agent.asks_for_password();
+                agent
+            })
+            .await;
+            assert_eq!(bus.cancel("real-cancel").await, Ok(()));
+            agent
+        };
+        let (answer, returned) = futures_lite::future::zip(checking, cancelling).await;
+        agent = returned;
+        assert_eq!(answer, Err(CANCELLED.to_string()));
+        agent.types(&format!("{user_password}\n"));
+        agent.shows("Cancelled");
+        agent.shows("==== AUTHENTICATION FAILED ====");
+        assert_eq!(bus.check(&subject, SELF).await, Ok(CHALLENGED));
+        drop(agent);
+
+        // Ctrl-C at the prompt ends pkttyagent (SIGINT from its terminal): it leaves the bus
+        // without answering, so not authorized.
+        let mut agent = TtyAgent::start(&bus, TEST_USER, app.pid());
+        let pkcheck = bus.start_pkcheck(SELF, app.pid(), true);
+        agent.asks_for_password();
+        agent.types("\x03");
+        assert_eq!(pkcheck_finished(pkcheck).0, Ok(PKCHECK_NOT_AUTHORIZED));
+        drop(agent);
+
+        // An agent killed during the dialog: the same.
+        let mut agent = TtyAgent::start(&bus, TEST_USER, app.pid());
+        let pkcheck = bus.start_pkcheck(SELF, app.pid(), true);
+        agent.asks_for_password();
+        let pid = rustix::process::Pid::from_raw(agent.pid() as i32).unwrap();
+        rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+        assert_eq!(pkcheck_finished(pkcheck).0, Ok(PKCHECK_NOT_AUTHORIZED));
+        assert_eq!(bus.check(&subject, SELF).await, Ok(CHALLENGED));
+        drop(agent);
+
+        // The user ends the input (Ctrl-D) instead of typing a password: pkttyagent returns as
+        // usual, so not authorized; it does not answer Cancelled, so not "dismissed" either. Last,
+        // and with an agent of its own: after an end of input, this pkttyagent ends every later
+        // dialog at once in the same way (observed).
+        let mut agent = TtyAgent::start(&bus, TEST_USER, app.pid());
+        let pkcheck = bus.start_pkcheck(SELF, app.pid(), true);
+        agent.asks_for_password();
+        agent.types("\x04");
+        agent.shows("==== AUTHENTICATION FAILED ====");
+        assert_eq!(pkcheck_finished(pkcheck).0, Ok(PKCHECK_NOT_AUTHORIZED));
     });
 }

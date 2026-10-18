@@ -543,10 +543,16 @@ Cookies are never logged.
   `unix-session`) and our `pkcheck`, run next to Debian's with the same options (same exit codes,
   0, 1, 2, 126, 127, the same details and the same or comparable diagnostics; `tests/compat.rs` of
   `nyra-pkcheck`), `libpolkit-gobject-1` through GObject introspection (`CheckAuthorization`, `EnumerateActions`, temporary authorizations, cancellation),
-  and a test agent on `libpolkit-agent-1` with the real `polkit-agent-helper-1` and a test user in
-  the container. Until that agent is in place, the tests' own agent covers the protocol: the test
-  binary, run again as another user, registers as an agent and passes each dialog on to the test,
-  which answers `AuthenticationAgentResponse2` as root, like the helper. The bus traffic of these
+  and the real agent stack: Debian's `pkttyagent` (on `libpolkit-agent-1`) in a pseudo-terminal
+  from `script`, with Debian 13's setuid `polkit-agent-helper-1`, PAM and test users that the test
+  makes with random passwords. It covers the right and a wrong password, `auth_self`, `auth_admin`
+  (an administrator chosen among the identities offered), `auth_self_keep` and its authorization
+  used again without a dialog, a cancellation by the caller, the end of input, Ctrl-C and a killed
+  agent. The helper does not follow `DBUS_SYSTEM_BUS_ADDRESS` and connects to the system bus's own
+  socket, so that test's bus listens there too, in a container where no system bus runs. For the
+  protocol's corner cases the tests also have their own agent: the test binary, run again as
+  another user, registers as an agent and passes each dialog on to the test, which answers
+  `AuthenticationAgentResponse2` as root, like the helper. The bus traffic of these
   clients is recorded, which is how the subject details they send are confirmed. The same `pkcheck` matrix also runs against Debian's polkitd (default
   rules only), and the answers must match.
 - **In the Nyra OS image** (later, before it replaces polkitd there): the image's own test battery
@@ -605,6 +611,15 @@ Read for this design; nothing from polkit's source code.
   and `polkit.retains_authorization_after_challenge` = `true`, a later check without user
   interaction is authorized by it, and `Changed` is sent when it is created;
   `EnumerateTemporaryAuthorizations` there accepts only `unix-session` subjects.
+- Observed on Debian 13 (polkit 126), with nyra-polkitd: `polkit-agent-helper-1` is installed
+  setuid root in `/usr/lib/polkit-1/`, with no socket-activated service for it, and connects to
+  `/run/dbus/system_bus_socket` whatever the agent's `DBUS_SYSTEM_BUS_ADDRESS`, and checks the
+  password with PAM (the package installs `/usr/lib/pam.d/polkit-1`). `pkttyagent` lists several identities by name and asks
+  which one; after a wrong password or an end of input it returns from `BeginAuthentication`
+  without an error and without an answer from the helper; Ctrl-C ends it. After
+  `CancelAuthentication` it shows "Cancelled" only once its read of the terminal ends, and then
+  answers neither call and shows no other dialog (the same with Debian's polkitd); after an end of
+  input it ends every later dialog at once.
 - Observed, Debian 13's `pkcheck` (polkit 126) run as a black box against its polkitd and against
   nyra-polkitd: its options and one-letter forms, what it refuses and with which message, its exit
   codes (126 for malformed options, also for a missing bus and when it cannot make its internal

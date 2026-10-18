@@ -45,3 +45,6 @@ nix = { version = "0.31.3", default-features = false, features = ["user"] }
 # Timers for the integration tests' timeouts, so a regression fails instead of hanging the job.
 # Already in zbus's dependency tree: no crate added.
 async-io = "2.6.0"
+# The terminal modes of Debian's pkttyagent, so a password is typed only once it is read. The
+# same rustix as above, with its "termios" feature for the tests only.
+rustix = { version = "1.1.5", default-features = false, features = ["termios"] }
