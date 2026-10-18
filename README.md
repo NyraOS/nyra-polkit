@@ -39,15 +39,18 @@ it.
 
 ## Status
 
-Early work. What exists today: the design ([`docs/DESIGN.md`](docs/DESIGN.md)) and `nyra-polkitd`,
-which owns `org.freedesktop.PolicyKit1` on the system bus, reads the standard action files
+Released: 0.1.2 is on [GitHub Releases](https://github.com/NyraOS/nyra-polkit/releases) and
+is used in place of `polkitd` in the Nyra OS image's tests. `nyra-polkitd` owns
+`org.freedesktop.PolicyKit1` on the system bus, reads the standard action files
 (`/usr/share/polkit-1/actions`) and the TOML rules, and answers `CheckAuthorization` and
 `EnumerateActions`. It serves authentication agents (the dialog that asks for a password) and
-keeps temporary authorizations (`auth_self_keep`, `auth_admin_keep`) for five minutes. The files
-that install it (systemd unit, bus policy and activation, system user) are in [`dist/`](dist).
+keeps temporary authorizations (`auth_self_keep`, `auth_admin_keep`) for five minutes. The design
+is in [`docs/DESIGN.md`](docs/DESIGN.md); the files that install it (systemd unit, bus policy and
+activation, system user) are in [`dist/`](dist). To install it on a Debian system, see
+[`docs/INSTALL.md`](docs/INSTALL.md).
 
-**It is not a drop-in replacement for polkit:** JavaScript `.rules` files are not read, and
-`pkexec` is not provided. Password checks stay with polkit's own `polkit-agent-helper-1`.
+**It is not yet a drop-in replacement for every system:** JavaScript `.rules` files are not read,
+and `pkexec` is not provided. Password checks stay with polkit's own `polkit-agent-helper-1`.
 
 Before `systemctl reload`, check your files with `nyra-polkitd --check`: it reads the action files
 and the rules exactly as the service does (without the bus), prints what it reads, replaces or
@@ -71,8 +74,8 @@ pkcheck (it refuses ambiguous or malformed values that polkit's guesses at) is l
 cargo build --release -p nyra-pkcheck   # target/release/pkcheck
 ```
 
-Nothing installs it yet; it replaces polkit's `pkcheck` (`/usr/bin/pkcheck`) once nyra-polkitd
-replaces polkitd. It reads `DBUS_SYSTEM_BUS_ADDRESS`, so it must never be setuid, and a
+[`docs/INSTALL.md`](docs/INSTALL.md) installs it; it replaces polkit's `pkcheck`
+(`/usr/bin/pkcheck`) once nyra-polkitd replaces polkitd. It reads `DBUS_SYSTEM_BUS_ADDRESS`, so it must never be setuid, and a
 privileged process must not run it with an environment inherited from an unprivileged one.
 
 ## Building
