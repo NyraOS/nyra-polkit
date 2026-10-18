@@ -383,4 +383,30 @@ mod tests {
         assert!(problems[1].contains("c2.policy") && problems[1].contains("more than once"));
         assert!(problems[2].contains("d.policy") && problems[2].contains("denied"));
     }
+
+    #[test]
+    fn a_fifo_is_refused_instead_of_blocking() {
+        let directory =
+            std::env::temp_dir().join(format!("nyra-polkit-actions-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            directory.join("a.policy"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        // Run on another thread: a regression would block forever instead of failing.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path = directory.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(load_actions(&path));
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        std::fs::remove_dir_all(&directory).unwrap();
+        let (actions, problems) = result.expect("opening a FIFO blocked");
+        assert!(actions.is_empty());
+        assert!(problems[0].contains("not a regular file"), "{problems:?}");
+    }
 }

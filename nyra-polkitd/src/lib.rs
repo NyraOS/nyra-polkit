@@ -18,9 +18,11 @@ pub mod rules;
 pub mod subject;
 pub mod temporary;
 
+use rustix::fs::OFlags;
 use serde::Deserialize;
-use std::fs::File;
+use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 /// What an action default or a rule gives a subject (polkit(8), "defaults"; `ImplicitAuthorization`
@@ -70,8 +72,30 @@ const MAX_FILE_SIZE: u64 = 4 << 20;
 
 /// Reads a whole configuration file, refusing one larger than [`MAX_FILE_SIZE`].
 fn read_config_file(path: &Path) -> Result<String, String> {
-    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let (file, _) = open_regular_file(path, "")?;
     read_opened_file(file, path)
+}
+
+/// Opens a file and checks what was opened (fstat), so a symbolic link is judged by its target and
+/// the file cannot be swapped between the check and the read. `not_regular_hint` ends the error
+/// for a file that is not a regular one.
+fn open_regular_file(path: &Path, not_regular_hint: &str) -> Result<(File, Metadata), String> {
+    // O_NONBLOCK: opening a FIFO would block until a writer comes, before the check below.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlags::NONBLOCK | OFlags::CLOEXEC).bits() as i32)
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "{}: not a regular file{not_regular_hint}",
+            path.display()
+        ));
+    }
+    Ok((file, metadata))
 }
 
 /// Reads an opened file to its end, refusing more than [`MAX_FILE_SIZE`]; `path` labels errors.

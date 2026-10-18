@@ -7,12 +7,11 @@
 //! fixed, because skipping a broken file could drop a rule that denies something. A file or
 //! directory that anyone but root could have written is such an error, as for sudoers.
 
-use crate::{Authorization, is_valid_action_id, read_opened_file};
-use rustix::fs::OFlags;
+use crate::{Authorization, is_valid_action_id, open_regular_file, read_opened_file};
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fs::{Metadata, OpenOptions};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::fs::Metadata;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// The rules that come with the image (read-only, verified with it).
@@ -255,22 +254,13 @@ fn rule_files(directory: &Path, owner: u32) -> Result<Vec<(String, PathBuf)>, St
 /// Opens a rule file and checks what was opened (fstat), so a symbolic link is judged by its
 /// target and the file cannot be swapped between the check and the read.
 fn read_trusted_file(path: &Path, owner: u32) -> Result<String, String> {
-    // O_NONBLOCK: opening a FIFO would block until a writer comes, before the check below.
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags((OFlags::NONBLOCK | OFlags::CLOEXEC).bits() as i32)
-        .open(path)
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| format!("{}: {error}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "{}: not a regular file (a link to /dev/null does not disable a file; to switch off \
-             a file of the image, put an empty file with the same name in {LOCAL_RULES_DIR})",
-            path.display()
-        ));
-    }
+    let (file, metadata) = open_regular_file(
+        path,
+        &format!(
+            " (a link to /dev/null does not disable a file; to switch off a file of the image, \
+             put an empty file with the same name in {LOCAL_RULES_DIR})"
+        ),
+    )?;
     check_owner_and_mode(&metadata, path, owner)?;
     read_opened_file(file, path)
 }
@@ -394,8 +384,8 @@ mod tests {
 
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    /// A new, empty `rules.d` in a new directory of its own (removed with [`remove`]), and the uid that owns it (the user running the tests), which stands
-    /// for root here.
+    /// A new, empty `rules.d` in a new directory of its own (removed with [`remove`]), and the uid
+    /// that owns it (the user running the tests), which stands for root here.
     fn temporary_directory(name: &str) -> (PathBuf, u32) {
         let parent =
             std::env::temp_dir().join(format!("nyra-polkit-{name}-{}", std::process::id()));
