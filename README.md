@@ -49,6 +49,10 @@ that install it (systemd unit, bus policy and activation, system user) are in [`
 **It is not a drop-in replacement for polkit:** JavaScript `.rules` files are not read, and
 `pkexec` is not provided. Password checks stay with polkit's own `polkit-agent-helper-1`.
 
+Before `systemctl reload`, check your files with `nyra-polkitd --check`: it reads the action files
+and the rules exactly as the service does (without the bus), prints what it reads, replaces or
+switches off, and any warning or error, and exits 0 if they are valid, 1 if not.
+
 ## pkcheck
 
 `nyra-pkcheck` builds a `pkcheck` with the options and exit codes of pkcheck(1): `--action-id`,

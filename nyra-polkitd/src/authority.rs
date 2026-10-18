@@ -13,7 +13,7 @@
 use crate::actions::{Actions, load_actions};
 use crate::agents::{self, Agent, Agents, Cookies};
 use crate::decision::{Subject, decide, is_administrator};
-use crate::rules::{Rules, load_rules};
+use crate::rules::{Rules, load_rules_owned_by};
 use crate::subject::Identified;
 use crate::temporary::{TemporaryAuthorizations, boot_clock};
 use crate::{Authorization, subject};
@@ -124,34 +124,73 @@ pub struct Policy {
 
 /// Loads the action definitions and the rules, logging what was read and every problem.
 pub fn load_policy(directories: &Directories) -> Policy {
+    load_policy_reporting(directories, 0, 4, |level, message| {
+        eprintln!("<{level}>{message}")
+    })
+    .0
+}
+
+/// What `nyra-polkitd --check` does: loads like the service and reports to `print` (severity as a
+/// syslog level: 3 error, 4 warning, 6 note). The files are valid when no action file has a
+/// problem and the rules load; warnings do not count.
+pub fn check_policy(directories: &Directories, print: impl FnMut(u8, &str)) -> bool {
+    check_policy_owned_by(directories, 0, print)
+}
+
+fn check_policy_owned_by(
+    directories: &Directories,
+    owner: u32,
+    print: impl FnMut(u8, &str),
+) -> bool {
+    let (policy, action_problems) = load_policy_reporting(directories, owner, 3, print);
+    policy.rules.is_ok() && !action_problems
+}
+
+/// [`load_policy`] with the owner the rule files must have (root, except in the tests) and the
+/// place for the messages, `report(syslog level, message)`. Problems of action files are reported
+/// at `problem_level`: the service goes on without such a file (warning), the check fails (error).
+/// Also says whether an action file had a problem.
+fn load_policy_reporting(
+    directories: &Directories,
+    owner: u32,
+    problem_level: u8,
+    mut report: impl FnMut(u8, &str),
+) -> (Policy, bool) {
     let (actions, problems) = load_actions(&directories.actions);
     for problem in &problems {
-        eprintln!("<4>{problem}");
+        report(problem_level, problem);
     }
-    let rules = load_rules(&directories.image_rules, &directories.local_rules);
+    let rules = load_rules_owned_by(&directories.image_rules, &directories.local_rules, owner);
     match &rules {
         Ok((rules, notes, warnings)) => {
             for warning in warnings {
-                eprintln!("<4>{warning}");
+                report(4, warning);
             }
             for note in notes {
-                eprintln!("<6>{note}");
+                report(6, note);
             }
-            eprintln!(
-                "<6>{} actions, {} rules, administrators: users {:?}, groups {:?}",
-                actions.len(),
-                rules.rules.len(),
-                rules.administrators.users,
-                rules.administrators.groups
+            report(
+                6,
+                &format!(
+                    "{} actions, {} rules, administrators: users {:?}, groups {:?}",
+                    actions.len(),
+                    rules.rules.len(),
+                    rules.administrators.users,
+                    rules.administrators.groups
+                ),
             );
         }
-        Err(error) => eprintln!("<3>{error}; every check is denied until it is fixed"),
+        Err(error) => report(
+            3,
+            &format!("{error}; every check is denied until it is fixed"),
+        ),
     }
-    Policy {
+    let policy = Policy {
         actions,
         rules: rules.map(|(rules, _, _)| rules),
         generation: 0,
-    }
+    };
+    (policy, !problems.is_empty())
 }
 
 /// The checks in flight, per caller (a unique bus name): how many, and the cancellation ids of
@@ -1445,5 +1484,115 @@ mod tests {
         assert_eq!(log.denied(start + Duration::from_secs(60)), Some(3));
         assert_eq!(log.denied(start + Duration::from_secs(61)), None);
         assert_eq!(log.denied(start + Duration::from_secs(200)), Some(2));
+    }
+
+    /// A directory tree of mode 755 that the test user owns, standing in for root's.
+    fn check_setup(name: &str) -> (PathBuf, Directories, u32) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!("nyra-polkit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let directories = Directories {
+            actions: root.join("actions"),
+            image_rules: root.join("image"),
+            local_rules: root.join("local"),
+        };
+        for path in [
+            &root,
+            &directories.actions,
+            &directories.image_rules,
+            &directories.local_rules,
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let owner = std::fs::metadata(&root).unwrap().uid();
+        (root, directories, owner)
+    }
+
+    fn write_file(path: PathBuf, text: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&path, text).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    fn check_messages(directories: &Directories, owner: u32) -> (bool, Vec<(u8, String)>) {
+        let mut messages = Vec::new();
+        let valid = check_policy_owned_by(directories, owner, |level, message| {
+            messages.push((level, message.to_string()))
+        });
+        (valid, messages)
+    }
+
+    #[test]
+    fn a_valid_rule_set_passes_the_check_with_notes_and_warnings() {
+        let (root, directories, owner) = check_setup("check-valid");
+        write_file(
+            directories.image_rules.join("50-a.toml"),
+            "[[rule]]\nactions = [\"org.example.a\"]\nresult = \"no\"\n",
+        );
+        write_file(
+            directories.image_rules.join("60-b.toml"),
+            "[[rule]]\nactions = [\"org.*\"]\nresult = \"yes\"\n",
+        );
+        write_file(
+            directories.local_rules.join("50-a.toml"),
+            "# switched off\n",
+        );
+
+        let (valid, messages) = check_messages(&directories, owner);
+        assert!(valid, "{messages:?}");
+        let text = |level: u8| {
+            messages
+                .iter()
+                .filter(|(l, _)| *l == level)
+                .map(|(_, message)| message.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert!(text(3).is_empty());
+        assert_eq!(text(4).len(), 1, "{messages:?}");
+        assert!(text(4)[0].contains("\"org.*\""));
+        assert!(text(6).iter().any(|note| note.contains("disables")));
+        assert!(text(6).iter().any(|note| note.contains("read ")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_invalid_rule_set_fails_the_check_with_the_error() {
+        let (root, directories, owner) = check_setup("check-invalid");
+        write_file(directories.local_rules.join("90-broken.toml"), "[[rule]]\n");
+        let (valid, messages) = check_messages(&directories, owner);
+        assert!(!valid);
+        assert!(
+            messages
+                .iter()
+                .any(|(level, message)| *level == 3 && message.contains("90-broken.toml")),
+            "{messages:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn files_not_owned_by_root_fail_the_check_and_name_the_owner() {
+        let (root, directories, owner) = check_setup("check-owner");
+        write_file(directories.image_rules.join("50-a.toml"), "# empty\n");
+        let (valid, messages) = check_messages(&directories, owner + 1);
+        assert!(!valid);
+        assert!(
+            messages
+                .iter()
+                .any(|(_, message)| message.contains(&format!("owned by uid {owner}"))),
+            "{messages:?}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_broken_action_file_fails_the_check() {
+        let (root, directories, owner) = check_setup("check-actions");
+        write_file(directories.actions.join("broken.policy"), "<policyconfig>");
+        let (valid, messages) = check_messages(&directories, owner);
+        assert!(!valid);
+        assert!(messages.iter().any(|(_, m)| m.contains("broken.policy")));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }
