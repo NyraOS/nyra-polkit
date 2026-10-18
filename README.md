@@ -109,8 +109,15 @@ was built by this repository's release workflow (the
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-gh attestation verify nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz -R NyraOS/nyra-polkit
+gh attestation verify nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz -R NyraOS/nyra-polkit \
+  --signer-workflow NyraOS/nyra-polkit/.github/workflows/release.yml \
+  --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
 ```
+
+- `-R NyraOS/nyra-polkit`: the attestation was made in this repository;
+- `--signer-workflow`: by the release workflow, not by any other workflow or a pull request run;
+- `--source-ref`: from the release's tag, not from a branch;
+- `--deny-self-hosted-runners`: on a runner hosted by GitHub.
 
 ## Contributing
 

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-# Releases (CONTRIBUTING.md, "Releases"): a tag vX.Y.Z on main builds nyra-polkitd and pkcheck for
-# x86_64 and aarch64 Linux (glibc), packs one tarball per architecture, attests their build
-# provenance and publishes them with SHA256SUMS on GitHub Releases.
+# Releases (CONTRIBUTING.md, "Releases"): a maintainer's signed tag vX.Y.Z on main builds
+# nyra-polkitd and pkcheck for x86_64 and aarch64 Linux (glibc), packs one tarball per
+# architecture, attests their build provenance and publishes them with SHA256SUMS on GitHub
+# Releases.
 # Every pull request runs the build and the packing too, without publishing anything, so a change
 # that breaks the release (on either architecture) shows up before a tag does.
 name: release
@@ -24,10 +25,18 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # The workflow cannot check the tag's signature (it has no key to check it against; GitHub
-      # shows whether it is verified), but it refuses a tag whose commit is not on main, and one
-      # whose version is not the version of both crates.
-      - name: Check the tag
+      # Before anything else on a tag: only a tag signed by a maintainer makes a release. The tag
+      # object is fetched again because checkout does not keep it annotated.
+      - name: Check the tag's signature
+        if: github.ref_type == 'tag'
+        run: |
+          git fetch -q --no-tags origin "+refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          tools/release/verify-tag.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      # And it refuses a tag whose commit is not on main, or whose version is not the version of
+      # both crates.
+      - name: Check the tag's commit and version
         if: github.ref_type == 'tag'
         run: |
           git fetch -q --no-tags --filter=blob:none origin main
@@ -43,8 +52,8 @@ jobs:
             fi
           done
       # The oldest Rust we support, Debian 13's, as in CI: the same compiler on every release.
-      - run: rustup toolchain install 1.85 --profile minimal
-      - run: cargo +1.85 build --release --locked -p nyra-polkitd -p nyra-pkcheck
+      - run: rustup toolchain install 1.85.1 --profile minimal
+      - run: cargo +1.85.1 build --release --locked -p nyra-polkitd -p nyra-pkcheck
       - name: Pack
         run: |
           version=dev
@@ -54,7 +63,7 @@ jobs:
           tar -xzf "$tarball" -C target/package
           "${tarball%.tar.gz}/bin/pkcheck" --version | grep -Fx "pkcheck version $(cargo pkgid --locked -p nyra-pkcheck | sed 's/.*[#@]//') (nyra-polkit)"
         env:
-          RUSTUP_TOOLCHAIN: "1.85"
+          RUSTUP_TOOLCHAIN: "1.85.1"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tarball-${{ matrix.runner }}
