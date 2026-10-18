@@ -175,10 +175,8 @@ async fn run_check(check: Check) -> u8 {
         }
     };
 
-    let mut keys: Vec<&String> = details.keys().collect();
-    keys.sort();
-    for key in keys {
-        println!("{}={}", escape(key), escape(&details[key]));
+    for line in detail_lines(&details) {
+        println!("{line}");
     }
     let (code, diagnostic) = verdict(authorized, challenge, &details, &check);
     if let Some(diagnostic) = diagnostic {
@@ -282,6 +280,15 @@ fn unix_process(pinned: &Pinned) -> SubjectValue<'_> {
             ("pidfd", Value::Fd(pinned.process.pidfd().into())),
         ]),
     )
+}
+
+/// The `KEY=VALUE` lines of an answer's details, sorted by key so the output is stable.
+fn detail_lines(details: &HashMap<String, String>) -> Vec<String> {
+    let mut keys: Vec<&String> = details.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .map(|key| format!("{}={}", escape(key), escape(&details[key])))
+        .collect()
 }
 
 /// pkcheck(1)'s output of details: bytes other than `[a-zA-Z0-9_]` as `\` and their octal value.
@@ -491,6 +498,25 @@ mod tests {
         assert_eq!(escape("Az_09"), "Az_09");
         assert_eq!(escape("a=b c\n"), r"a\75b\40c\12");
         assert_eq!(escape(""), "");
+    }
+
+    #[test]
+    fn details_are_printed_sorted_by_key() {
+        let details: HashMap<String, String> = ["m", "b", "z", "a", "polkit.dismissed", "k"]
+            .into_iter()
+            .map(|key| (key.to_string(), format!("v{key}")))
+            .collect();
+        assert_eq!(
+            detail_lines(&details),
+            [
+                "a=va",
+                "b=vb",
+                "k=vk",
+                "m=vm",
+                r"polkit\56dismissed=vpolkit\56dismissed",
+                "z=vz",
+            ]
+        );
     }
 
     #[test]
