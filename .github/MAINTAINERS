@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: MIT
+# The GitHub logins of the maintainers who sign release tags, one per line. The release workflow
+# trusts only the signing keys these accounts have registered on GitHub (CONTRIBUTING.md, "Releases").
+MrTuNNe

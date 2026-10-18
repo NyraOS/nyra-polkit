@@ -13,5 +13,6 @@ keep you informed, and credit you in the fix unless you prefer otherwise.
 
 ## Supported versions
 
-The project is in early development and nothing is released yet. Only the `main` branch is
+The project is in early development: only the latest release
+([GitHub Releases](https://github.com/NyraOS/nyra-polkit/releases)) and the `main` branch are
 supported.

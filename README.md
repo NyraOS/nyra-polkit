@@ -88,6 +88,67 @@ cargo test --test dbus --test compat -- --ignored
 
 Rust 1.85 or newer (the version in Debian 13).
 
+## Releases
+
+Releases follow [SemVer](https://semver.org) and are published on
+[GitHub Releases](https://github.com/NyraOS/nyra-polkit/releases), built by the
+[release workflow](.github/workflows/release.yml) from a signed `vX.Y.Z` tag on `main`. Each one
+has a tarball per architecture, `nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz` and
+`nyra-polkit-X.Y.Z-aarch64-linux-gnu.tar.gz` (Linux, glibc), with:
+
+- `bin/nyra-polkitd` and `bin/pkcheck`;
+- `dist/`: the systemd unit, the D-Bus policy and activation file and the sysusers file, each
+  naming where it is installed in its first lines;
+- `LICENSE`, `README.md`, `SECURITY.md`;
+- `third-party/`: the licence files of every crate built into the binaries, and `CRATES`, their
+  list with versions and licences.
+
+To check a download, first compare it with `SHA256SUMS` from the same release:
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+Then check where it came from. Your trust should rest on the maintainer's signature on the tag,
+which no access token can make, and not only on the release workflow: anyone holding a token that
+can push tags could also run a changed workflow. From a clone of this repository, with `git`,
+`gpg`, `ssh-keygen` and the [GitHub CLI](https://cli.github.com) 2.102 or newer, logged in
+(older versions lack or match more loosely the checks below, and Debian 13's gh 2.46 has no
+`attestation` command; [cli.github.com](https://cli.github.com) has packages for most
+distributions):
+
+```sh
+git clone https://github.com/NyraOS/nyra-polkit && cd nyra-polkit
+tools/release/verify-download.sh ../nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz
+```
+
+It stops at the first check that fails:
+
+1. **The tag is signed by a maintainer.** It fetches the tag `vX.Y.Z` from GitHub and runs
+   `git verify-tag` with only the public signing keys that the logins in
+   [`.github/MAINTAINERS`](.github/MAINTAINERS) have registered on GitHub
+   ([`tools/release/verify-tag.sh`](tools/release/verify-tag.sh)). The tag must be annotated and
+   signed with OpenPGP or SSH, and a GPG signature must name one of those keys' fingerprints, so
+   nothing in the machine's own GnuPG configuration (keys fetched or imported while verifying,
+   trusted X.509 authorities) can make another signature count. Check the signature with this
+   script rather than with a bare `git verify-tag`, which trusts whatever your GnuPG setup trusts.
+2. **The tag's commit is on `main`'s history** (`git merge-base --is-ancestor <commit> main`).
+3. **The tarball was built by the release workflow, from that tag and that commit:**
+   ```sh
+   gh attestation verify nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz -R NyraOS/nyra-polkit \
+     --signer-workflow NyraOS/nyra-polkit/.github/workflows/release.yml \
+     --source-ref refs/tags/vX.Y.Z --source-digest <commit> --deny-self-hosted-runners
+   ```
+   - `-R NyraOS/nyra-polkit`: the attestation was made in this repository;
+   - `--signer-workflow`: by the release workflow, not by any other workflow or a pull request
+     run;
+   - `--source-ref`: from the release's tag, not from a branch;
+   - `--source-digest`: from the commit the signed tag points to;
+   - `--deny-self-hosted-runners`: on a runner hosted by GitHub.
+
+`.github/MAINTAINERS` says whose signature you trust: a change to it is a change of trust, and
+its history shows who made it.
+
 ## Contributing
 
 Every change goes through a pull request. nyra-polkit is written only from documented interfaces
