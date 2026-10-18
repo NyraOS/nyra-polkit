@@ -49,6 +49,26 @@ unit, bus policy and activation, system user) are in [`dist/`](dist).
 **It is not a drop-in replacement for polkit:** JavaScript `.rules` files are not read, and
 `pkexec` is not provided. Password checks stay with polkit's own `polkit-agent-helper-1`.
 
+## pkcheck
+
+`nyra-pkcheck` builds a `pkcheck` with the options and exit codes of pkcheck(1): `--action-id`,
+`--process PID[,START_TIME[,UID]]` or `--system-bus-name`, `--detail KEY VALUE`,
+`--allow-user-interaction`, `--list-temp`, `--revoke-temp`, `--version` and `--help`. It exits
+with 0 (authorized), 1 (not authorized), 2 (an authentication is needed), 3 (the authentication was
+dismissed), 126 (malformed options) or 127 (an error), prints the answer's details on standard
+output and its diagnostics on standard error, as Debian's pkcheck does; the integration tests run
+both side by side. It pins the process it asks about with a pidfd. `--enable-internal-agent` is not
+supported: run an authentication agent instead. Where it deliberately differs from polkit's
+pkcheck (it refuses ambiguous or malformed values that polkit's guesses at) is listed in
+[`docs/DESIGN.md`](docs/DESIGN.md#pkcheck).
+
+```sh
+cargo build --release -p nyra-pkcheck   # target/release/pkcheck
+```
+
+Nothing installs it yet; it replaces polkit's `pkcheck` (`/usr/bin/pkcheck`) once nyra-polkitd
+replaces polkitd.
+
 ## Building
 
 ```sh
@@ -61,7 +81,7 @@ The D-Bus integration tests run nyra-polkitd on a private bus and need root, a w
 `dbus-daemon`, `polkitd` and `systemd` packages); CI runs them in a privileged Debian 13 container:
 
 ```sh
-cargo test --test dbus -- --ignored
+cargo test --test dbus --test compat -- --ignored
 ```
 
 Rust 1.85 or newer (the version in Debian 13).

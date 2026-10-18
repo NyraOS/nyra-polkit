@@ -305,6 +305,81 @@ only). Details are not compared: the same action
 and subject succeed even with other details, as polkit(8) says; rules that depend on details should
 not use the `_keep` results.
 
+## pkcheck
+
+`pkcheck` (the `nyra-pkcheck` crate) is a client of the interface above with the options, output
+and exit codes of pkcheck(1). The integration tests run it next to Debian 13's `pkcheck` (polkit
+126) against `nyra-polkitd`, and both must answer the same.
+
+| Option | Meaning |
+|---|---|
+| `--action-id`, `-a` ACTION | the action to check |
+| `--process`, `-p` PID[,START_TIME[,UID]] | the subject: a process |
+| `--system-bus-name`, `-s` NAME | the subject: the owner of a unique bus name |
+| `--detail`, `-d` KEY VALUE | a detail for the check; repeatable |
+| `--allow-user-interaction`, `-u` | the `AllowUserInteraction` flag |
+| `--enable-internal-agent` | not supported (below) |
+| `--list-temp`, `--revoke-temp` | the temporary authorizations of the current session |
+| `--version`, `--help`, `-h` | |
+
+As with Debian's pkcheck, each value is its own argument (no `--option=value`, no `--`, no grouped
+one-letter options), anything else is "Unexpected argument", and `--help`, `--version`,
+`--list-temp`, `--revoke-temp` win, in that order, over a check.
+
+**The process is pinned.** `--process` opens a pidfd for the PID and reads, under it, the start
+time and the real uid; a start time or uid given by the caller must be the process's, or pkcheck
+fails (127) without asking: the PID then names another process than the one meant. The subject
+carries `pid` (`u`), `start-time` (`t`), `uid` (`i`) and the `pidfd` (`h`), so an authority that
+takes a pidfd (nyra-polkitd) uses it, and one that does not (Debian's polkitd, observed) has the
+start time. `--system-bus-name` takes only unique names.
+
+**Output.** The details of the answer go to standard output as `KEY=VALUE` lines, keys sorted, with
+every byte outside `[a-zA-Z0-9_]` written as `\` and its octal value, as pkcheck(1) shows.
+Diagnostics go to standard error, worded as Debian's pkcheck words them.
+
+| Exit code | When |
+|---|---|
+| 0 | authorized |
+| 1 | not authorized; for `--list-temp` and `--revoke-temp`, no session or a refusal (as Debian's) |
+| 2 | not authorized, an authentication is needed: without `-u`, or with `-u` and no agent |
+| 3 | the authentication was dismissed (`polkit.dismissed` in the answer) |
+| 126 | malformed options; `--enable-internal-agent` when an agent would be needed |
+| 127 | any other error: the bus, the process, or an error from the authority |
+
+A check without `-u` waits at most 25 s, the usual D-Bus timeout; with `-u` it waits for the user.
+
+**The session** of `--list-temp` and `--revoke-temp` is the one pkcheck runs in: logind puts each
+session's processes in `session-<id>.scope` directly under their user's slice
+(`/user.slice/user-<uid>.slice/`, cgroup v2), and Debian's pkcheck was observed to find it there
+too. Outside one, both print `Error getting session: No session for pid <pid>` and exit with 1.
+The subject sent is that `unix-session`. pkcheck(1) does not define the listing; ours is one line
+per authorization: `<id>: <action> for <subject kind> <key>=<value>..., obtained <n> s ago,
+expires in <m> s`.
+
+**`--enable-internal-agent`** would need a text authentication agent inside pkcheck, which would
+need the protocol of `polkit-agent-helper-1`; it is not documented, so pkcheck does not have one.
+The option is accepted and only matters when a check with `-u` needs an authentication that no
+agent answered: pkcheck then exits with 126 and says to run an agent (for example `pkttyagent`).
+Debian's pkcheck exits with 126 there too when it cannot make its agent (no terminal), which is
+the case for services and scripts.
+
+**Where it differs from Debian's pkcheck**, on purpose:
+
+- A `--process` field that is not all digits, more than three fields, a PID or start time of 0, or
+  a PID or uid above 2^31 - 1 are malformed (126). Debian's pkcheck reads `1,x`, `1x` and `1,` as
+  PID 1, uses the first three of `1,2,3,4`, and sends `-5` or `0` to the authority.
+- A second `--action-id`, or a second subject (`--process` or `--system-bus-name`), is malformed:
+  which one was meant cannot be known. Debian's pkcheck uses the last one.
+- No `--action-id` is malformed (126); Debian's pkcheck fails a GLib assertion and exits with 127.
+- A bus name that is not unique is "Invalid --system-bus-name value" (126); Debian's pkcheck says
+  "Subject not specified" (126).
+- A system bus that cannot be reached is an error (127, as pkcheck(1) says); Debian's pkcheck
+  exits with 126.
+- A process that is gone, or whose start time or uid is not the one given, fails before the call
+  (127, as with Debian's, whose authority refuses it), with a message of our own.
+- `--help` has its own text; a malformed option never shows the manual page, even on a terminal.
+  `--version` prints `pkcheck version <version> (nyra-polkit)`.
+
 ## Security
 
 What must hold:
@@ -406,8 +481,9 @@ Cookies are never logged.
   `GetSessionByPID` per PID). The container is privileged, so that a test can put a process under
   a user's service manager (a cgroup). Every wait of the tests has a timeout, so a regression fails
   instead of hanging. Clients: Debian's `pkcheck`, `busctl` (for the subjects `pkcheck` cannot send,
-  `unix-session`) and our `pkcheck` (same exit codes: 0, 1, 2, 3, 126, 127), `libpolkit-gobject-1` through GObject
-  introspection (`CheckAuthorization`, `EnumerateActions`, temporary authorizations, cancellation),
+  `unix-session`) and our `pkcheck`, run next to Debian's with the same options (same exit codes,
+  0, 1, 2, 126, 127, the same details and the same or comparable diagnostics; `tests/compat.rs` of
+  `nyra-pkcheck`), `libpolkit-gobject-1` through GObject introspection (`CheckAuthorization`, `EnumerateActions`, temporary authorizations, cancellation),
   and a test agent on `libpolkit-agent-1` with the real `polkit-agent-helper-1` and a test user in
   the container. The bus traffic of these clients is recorded, which is how the subject details
   they send are confirmed. The same `pkcheck` matrix also runs against Debian's polkitd (default
@@ -421,8 +497,9 @@ Few, and each justified in `Cargo.toml`: `roxmltree` (action XML), `serde` and `
 `zbus` (the bus, with its own small async runtime, no tokio) and `nix` (user names and groups from
 NSS). `rustix` (pidfds), `async-signal` (SIGHUP), `async-channel` (cancellation), `blocking` (NSS
 and `/proc` reads off the executor) and `futures-lite` are used directly but come with zbus anyway;
-so does `async-io`, used by the tests for timeouts. `cargo deny` checks their licences and
-advisories on every pull request.
+so does `async-io`, used by the tests for timeouts. `pkcheck` adds none: it parses its options by
+hand and uses `zbus`, `futures-lite` and the daemon's own `Process`. `cargo deny` checks their
+licences and advisories on every pull request.
 
 ## Sources
 
@@ -434,8 +511,10 @@ Read for this design; nothing from polkit's source code.
   <https://www.freedesktop.org/software/polkit/docs/latest/eggdbus-interface-org.freedesktop.PolicyKit1.AuthenticationAgent.html>
 - polkit(8) (actions, defaults, annotations, administrators, `_keep`):
   <https://www.freedesktop.org/software/polkit/docs/latest/polkit.8.html>
-- pkcheck(1) (options, process forms, exit codes):
+- pkcheck(1) (options, process forms, output of details, exit codes):
   <https://www.freedesktop.org/software/polkit/docs/latest/pkcheck.1.html>
+- polkit Reference Manual, `PolkitTemporaryAuthorization` (times in seconds since the epoch):
+  <https://www.freedesktop.org/software/polkit/docs/latest/PolkitTemporaryAuthorization.html>
 - polkit Reference Manual, `PolkitUnixProcess` and `PolkitSystemBusName` (subject fields):
   <https://www.freedesktop.org/software/polkit/docs/latest/PolkitUnixProcess.html>,
   <https://www.freedesktop.org/software/polkit/docs/latest/PolkitSystemBusName.html>
@@ -454,3 +533,9 @@ Read for this design; nothing from polkit's source code.
   and `Active=yes`; Debian 13's `pkcheck` (polkit 126) sends a `unix-process` subject with `pid`
   (`u`), `start-time` (`t`) and `uid` (`i`), no pidfd, and reads the result of `CheckAuthorization`
   as one `(bba{ss})` struct.
+- Observed, Debian 13's `pkcheck` (polkit 126) run as a black box against its polkitd and against
+  nyra-polkitd: its options and one-letter forms, what it refuses and with which message, its exit
+  codes (126 for malformed options, also for a missing bus and when it cannot make its internal
+  agent; 127 for errors), its diagnostics, the details it prints, the session it takes from its
+  cgroup for `--list-temp` and `--revoke-temp` (a `unix-session` subject), and that Debian's
+  polkitd accepts a subject with a `pidfd` next to `start-time` and `uid`.
