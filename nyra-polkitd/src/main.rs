@@ -95,10 +95,16 @@ fn parse_arguments(
             "--local-rules-dir" => &mut directories.local_rules,
             _ => return Err(format!("unknown option {option:?}")),
         };
-        *directory = arguments
+        let value = arguments
             .next()
-            .map(PathBuf::from)
             .ok_or_else(|| format!("{option} needs a directory"))?;
+        // `--actions-dir --check` is a forgotten value, not a directory named `--check`.
+        if value.starts_with("--") {
+            return Err(format!(
+                "{option} needs a directory, not the option {value:?}"
+            ));
+        }
+        *directory = PathBuf::from(value);
     }
     Ok((mode, directories))
 }
