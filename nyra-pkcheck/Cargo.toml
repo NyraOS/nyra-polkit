@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 [package]
 name = "nyra-pkcheck"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # The Rust in Debian 13 (trixie), as for the daemon.
 rust-version = "1.85"

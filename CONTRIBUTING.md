@@ -36,6 +36,8 @@ nyra-polkit decides who may do what on a Nyra OS machine, so the rules are stric
 Versions follow [SemVer](https://semver.org), starting at 0.1.0. A release is a tag `vX.Y.Z` on
 `main`, signed by a maintainer; the [release workflow](.github/workflows/release.yml) builds,
 attests and publishes it. Nothing else creates tags or releases.
+v0.1.0 is a tag without a release (pushed before the release workflow existed); releases start at
+v0.1.1.
 
 The maintainers are listed in [`.github/MAINTAINERS`](.github/MAINTAINERS), one GitHub login per
 line. Each registers a signing key (SSH or GPG) in their GitHub account, under "SSH and GPG
@@ -45,20 +47,21 @@ key, upload its public key to GitHub again (or register an SSH signing key).
 
 1. In a pull request, set the new version in `nyra-polkitd/Cargo.toml` and
    `nyra-pkcheck/Cargo.toml`, run `cargo update --workspace` so `Cargo.lock` follows, and merge it.
-   Skip this step when the crates already have the version to release (0.1.0 does).
+   Skip this step when the crates already have the version to release.
 2. Tag the merged commit with a signed, annotated tag, check it as the workflow will and push it:
    ```sh
    git fetch origin
-   git tag -s v0.1.0 -m "nyra-polkit 0.1.0" origin/main
-   tools/release/verify-tag.sh v0.1.0 "$(git rev-parse origin/main)"
-   git push origin v0.1.0
+   git tag -s v0.1.1 -m "nyra-polkit 0.1.1" origin/main
+   tools/release/verify-tag.sh v0.1.1 "$(git rev-parse origin/main)"
+   git push origin v0.1.1
    ```
    `-s` signs with your GPG key, or with your SSH key when `gpg.format=ssh` and
-   `user.signingkey` point at it. Check with `verify-tag.sh` (it needs the GitHub CLI, logged
-   in), not with `git tag -v`: that one uses your local keys, while the workflow uses the keys
-   GitHub holds, which may differ (a key extended locally but still expired on GitHub passes
-   `git tag -v` and fails the workflow). A pushed tag is never reused, so a tag the workflow
-   refuses costs that version.
+   `user.signingkey` point at it. Check with `verify-tag.sh` (it needs GnuPG and OpenSSH's
+   `ssh-keygen` whatever kind of key you sign with, and the [GitHub CLI](https://cli.github.com)
+   2.102 or newer, logged in; on macOS `brew install gnupg gh`), not with `git tag -v`: that one
+   uses your local keys, while the workflow uses the keys GitHub holds, which may differ (a key
+   extended locally but still expired on GitHub passes `git tag -v` and fails the workflow). A
+   pushed tag is never reused, so a tag the workflow refuses costs that version.
 
 Before it builds anything, the workflow ([`tools/release/verify-tag.sh`](tools/release/verify-tag.sh))
 refuses the tag unless it is annotated, points at the commit being built and is signed by one of
