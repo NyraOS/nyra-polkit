@@ -13,7 +13,9 @@ on:
 permissions:
   contents: read
 jobs:
+  # A skipped pull_request run under the same name counts as passed: name a fork's run apart.
   rust:
+    name: ${{ github.event_name == 'pull_request' && 'rust (fork)' || 'rust' }}
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -36,6 +38,7 @@ jobs:
   # process under a user's service manager (user@<uid>.service) or in a session's scope. The job
   # has no secrets and a read-only token.
   integration:
+    name: ${{ github.event_name == 'pull_request' && 'integration (fork)' || 'integration' }}
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -51,6 +54,7 @@ jobs:
       - run: cargo test --locked --test dbus --test compat -- --ignored
 
   deny:
+    name: ${{ github.event_name == 'pull_request' && 'deny (fork)' || 'deny' }}
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -65,6 +69,7 @@ jobs:
 
   # Runs the gitleaks container directly: the gitleaks GitHub Action needs a licence for organizations.
   gitleaks:
+    name: ${{ github.event_name == 'pull_request' && 'gitleaks (fork)' || 'gitleaks' }}
     if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-24.04
     timeout-minutes: 10
