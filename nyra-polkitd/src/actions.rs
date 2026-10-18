@@ -14,7 +14,7 @@ use std::path::Path;
 pub const ACTIONS_DIR: &str = "/usr/share/polkit-1/actions";
 
 /// Real files have a few thousand nodes; the limit stops a file with a huge number of elements
-/// (roxmltree itself stops entity bombs).
+/// (entity bombs are stopped earlier: `parse_policy` refuses any entity declaration).
 const MAX_XML_NODES: u32 = 200_000;
 
 /// All known actions, by id.
@@ -355,7 +355,8 @@ mod tests {
             xml.push_str(&format!("<!ENTITY a{level} \"{}\">", previous.repeat(10)));
         }
         xml.push_str("]><policyconfig><vendor>&a11;</vendor></policyconfig>");
-        assert!(parse_policy(&xml).is_err());
+        let error = parse_policy(&xml).unwrap_err();
+        assert!(error.contains("entity"), "{error}");
     }
 
     #[test]
