@@ -30,7 +30,8 @@ jobs:
 
   # nyra-polkitd on a private system-like bus, as root in Debian 13: its dbus-daemon gives
   # ProcessFD, its pkcheck and busctl are clients (Debian's pkcheck also runs next to ours, which
-  # must answer the same), and its polkitd package creates the polkitd user the daemon runs as.
+  # must answer the same), and its polkitd package creates the polkitd user the daemon runs as and
+  # brings pkttyagent and the setuid polkit-agent-helper-1, which one test runs with PAM.
   # Debian's own Rust (1.85) builds it. Privileged, for a writable /sys/fs/cgroup: tests put a
   # process under a user's service manager (user@<uid>.service) or in a session's scope. The job
   # has no secrets and a read-only token.
