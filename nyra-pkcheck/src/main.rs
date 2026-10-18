@@ -48,7 +48,7 @@ Options:
   -s, --system-bus-name BUS_NAME     Check authorization of the owner of BUS_NAME (unique name)
   -d, --detail KEY VALUE             Add (KEY, VALUE) to information about the action
   -u, --allow-user-interaction       Interact with the user if necessary
-  --enable-internal-agent            Not supported: run an authentication agent instead
+  --enable-internal-agent            Accepted; fails (126) when an agent is needed
   --list-temp                        List temporary authorizations for the current session
   --revoke-temp                      Revoke all temporary authorizations for the current session
   --version                          Show the version
@@ -231,6 +231,7 @@ fn pin_process(pid: u32, start_time: Option<u64>, uid: Option<u32>) -> Result<Pi
     let process = Process::open(pid)?;
     let actual_start_time = process.start_time()?;
     let actual_uid = process.real_uid()?;
+    let wire_uid = wire_uid(pid, actual_uid)?;
     process.ensure_alive()?;
     if start_time.is_some_and(|given| given != actual_start_time) {
         return Err(format!(
@@ -243,7 +244,18 @@ fn pin_process(pid: u32, start_time: Option<u64>, uid: Option<u32>) -> Result<Pi
     Ok(Pinned {
         process,
         start_time: actual_start_time,
-        uid: actual_uid,
+        uid: wire_uid,
+    })
+}
+
+/// The uid as the `i` the subject carries it in (polkit's interface). A uid above i32::MAX would
+/// wrap to a negative one that the daemon refuses, so it is refused here, clearly.
+fn wire_uid(pid: u32, uid: u32) -> Result<i32, String> {
+    i32::try_from(uid).map_err(|_| {
+        format!(
+            "process {pid} belongs to uid {uid}, which is above {}",
+            i32::MAX
+        )
     })
 }
 
@@ -251,7 +263,8 @@ fn pin_process(pid: u32, start_time: Option<u64>, uid: Option<u32>) -> Result<Pi
 struct Pinned {
     process: Process,
     start_time: u64,
-    uid: u32,
+    /// The real uid, as the `i` the subject carries it in.
+    uid: i32,
 }
 
 type SubjectValue<'a> = (&'static str, HashMap<&'static str, Value<'a>>);
@@ -265,8 +278,7 @@ fn unix_process(pinned: &Pinned) -> SubjectValue<'_> {
         HashMap::from([
             ("pid", Value::U32(pinned.process.pid())),
             ("start-time", Value::U64(pinned.start_time)),
-            // At most i32::MAX: the uid of a process is never -1.
-            ("uid", Value::I32(pinned.uid as i32)),
+            ("uid", Value::I32(pinned.uid)),
             ("pidfd", Value::Fd(pinned.process.pidfd().into())),
         ]),
     )
@@ -548,6 +560,18 @@ mod tests {
     }
 
     #[test]
+    fn a_uid_that_does_not_fit_an_i_is_refused_not_wrapped() {
+        assert_eq!(wire_uid(7, 1000), Ok(1000));
+        assert_eq!(wire_uid(7, i32::MAX as u32), Ok(i32::MAX));
+        for uid in [i32::MAX as u32 + 1, u32::MAX - 1] {
+            let Err(refused) = wire_uid(7, uid) else {
+                panic!("uid {uid} accepted");
+            };
+            assert!(refused.contains("process 7") && refused.contains(&uid.to_string()));
+        }
+    }
+
+    #[test]
     fn a_process_is_pinned_only_with_its_own_start_time_and_uid() {
         let mut child = std::process::Command::new("sleep")
             .arg("60")
@@ -577,7 +601,7 @@ mod tests {
         assert_eq!(kind, "unix-process");
         assert_eq!(details["pid"], Value::U32(pid));
         assert_eq!(details["start-time"], Value::U64(start_time));
-        assert_eq!(details["uid"], Value::I32(uid as i32));
+        assert_eq!(details["uid"], Value::I32(uid.try_into().unwrap()));
         assert!(matches!(details["pidfd"], Value::Fd(_)));
 
         // Exited but not reaped yet: its PID and /proc entry are still there, but it is gone.

@@ -57,8 +57,9 @@ that install it (systemd unit, bus policy and activation, system user) are in [`
 with 0 (authorized), 1 (not authorized), 2 (an authentication is needed), 3 (the authentication was
 dismissed), 126 (malformed options) or 127 (an error), prints the answer's details on standard
 output and its diagnostics on standard error, as Debian's pkcheck does; the integration tests run
-both side by side. It pins the process it asks about with a pidfd. `--enable-internal-agent` is not
-supported: run an authentication agent instead. Where it deliberately differs from polkit's
+both side by side. It pins the process it asks about with a pidfd. `--enable-internal-agent` is accepted but
+has no agent to offer: a check with `-u` that needs an authentication then exits with 126, so run
+an authentication agent instead. Where it deliberately differs from polkit's
 pkcheck (it refuses ambiguous or malformed values that polkit's guesses at) is listed in
 [`docs/DESIGN.md`](docs/DESIGN.md#pkcheck).
 
