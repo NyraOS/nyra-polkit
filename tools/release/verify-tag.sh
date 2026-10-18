@@ -43,16 +43,28 @@ printf '%s\n' no-auto-key-retrieve no-auto-key-import >"$GNUPGHOME/gpg.conf"
 touch "$keys/allowed_signers"
 key_count=0
 
-while read -r login; do
+# Writes one kind of a login's keys (ssh_signing_keys or gpg_keys) to $keys/<kind>, through a jq
+# filter; stops on any API error.
+read_keys() {
+  local login=$1 kind=$2 filter=$3 error
+  if ! error=$(gh api "users/$login/$kind" --jq "$filter" 2>&1 >"$keys/$kind"); then
+    echo "verify-tag.sh: cannot read the $kind of $login from the GitHub API:" >&2
+    echo "$error" >&2
+    exit 1
+  fi
+}
+
+# `|| [ -n "$login" ]`: a last line without a newline still counts.
+while read -r login || [ -n "$login" ]; do
   case $login in "" | "#"*) continue ;; esac
   # `login ssh-ed25519 AAAA...` lines: the login is the signer's name in the allowed-signers file.
-  gh api "users/$login/ssh_signing_keys" --jq '.[].key' >"$keys/ssh"
-  sed "s/^/$login /" "$keys/ssh" >>"$keys/allowed_signers"
-  key_count=$((key_count + $(wc -l <"$keys/ssh")))
+  read_keys "$login" ssh_signing_keys '.[].key'
+  sed "s/^/$login /" "$keys/ssh_signing_keys" >>"$keys/allowed_signers"
+  key_count=$((key_count + $(wc -l <"$keys/ssh_signing_keys")))
   # One armored public key (with its subkeys) per registered GPG key, revoked ones left out.
-  gh api "users/$login/gpg_keys" --jq '.[] | select(.revoked | not) | .raw_key // empty' >"$keys/gpg"
-  if [ -s "$keys/gpg" ]; then
-    gpg --batch --quiet --import "$keys/gpg"
+  read_keys "$login" gpg_keys '.[] | select(.revoked | not) | .raw_key // empty'
+  if [ -s "$keys/gpg_keys" ]; then
+    gpg --batch --quiet --import "$keys/gpg_keys"
     key_count=$((key_count + 1))
   fi
 done <.github/MAINTAINERS

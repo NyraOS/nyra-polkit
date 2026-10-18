@@ -46,7 +46,10 @@ cargo tree --locked --workspace --edges normal --prefix none --format '{p}|{l}' 
     echo "$crate $crate_version: $license" >>"$stage/third-party/CRATES"
   done
 
-# Same order, owner and dates on every build of the same commit.
+# Same order, owner, modes and dates on every build of the same commit, whatever the umask.
+find "$stage" -type d -exec chmod 0755 {} +
+find "$stage" -type f -exec chmod 0644 {} +
+chmod 0755 "$stage/bin/nyra-polkitd" "$stage/bin/pkcheck"
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$(git log -1 --format=%ct)" \
   -C "$output" -cf - "$name" | gzip -n >"$output/$name.tar.gz"
 rm -rf "$stage"
