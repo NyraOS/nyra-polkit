@@ -436,8 +436,8 @@ Cookies are never logged.
   and a test agent on `libpolkit-agent-1` with the real `polkit-agent-helper-1` and a test user in
   the container. Until that agent is in place, the tests' own agent covers the protocol: the test
   binary, run again as another user, registers as an agent and passes each dialog on to the test,
-  which answers `AuthenticationAgentResponse2` as root, like the helper. The bus traffic of these clients is recorded, which is how the subject details
-  they send are confirmed. The same `pkcheck` matrix also runs against Debian's polkitd (default
+  which answers `AuthenticationAgentResponse2` as root, like the helper. The bus traffic of these
+  clients is recorded, which is how the subject details they send are confirmed. The same `pkcheck` matrix also runs against Debian's polkitd (default
   rules only), and the answers must match.
 - **In the Nyra OS image** (later, before it replaces polkitd there): the image's own test battery
   in a VM, with a KDE session, NetworkManager, udisks2 and Flatpak.
