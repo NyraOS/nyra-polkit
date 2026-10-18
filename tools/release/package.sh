@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Packs a release tarball from `cargo build --release --locked` in this checkout: the binaries, the
-# files in dist/, LICENSE, README.md, SECURITY.md and the licence notices of every crate built into
-# the binaries. Run it from the top of the repository, after the build, on the machine that built
-# it (it reads the crates cargo unpacked there).
+# files in dist/, LICENSE, README.md, SECURITY.md, Cargo.lock (the lock file the build was locked
+# to, for SBOMs) and the licence notices of every crate built into the binaries. Run it from the top
+# of the repository, after the build, on the machine that built it (it reads the crates cargo
+# unpacked there).
 #
 #   tools/release/package.sh VERSION OUTPUT_DIR   # OUTPUT_DIR/nyra-polkit-VERSION-<arch>-linux-gnu.tar.gz
 set -euo pipefail
@@ -18,7 +19,7 @@ rm -rf "$stage"
 mkdir -p "$stage/bin" "$stage/dist" "$stage/third-party"
 cp target/release/nyra-polkitd target/release/pkcheck "$stage/bin/"
 cp dist/* "$stage/dist/"
-cp LICENSE README.md SECURITY.md "$stage/"
+cp LICENSE README.md SECURITY.md Cargo.lock "$stage/"
 
 # The crates built into the binaries, with the proc-macros (and their dependencies) that write part
 # of their code: normal dependencies for this machine's target, without build or dev dependencies.
