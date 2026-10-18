@@ -31,6 +31,8 @@ trait Manager {
 )]
 trait LoginSession {
     #[zbus(property)]
+    fn id(&self) -> zbus::Result<String>;
+    #[zbus(property)]
     fn remote(&self) -> zbus::Result<bool>;
     /// The seat id and its object path; an empty id without a seat.
     #[zbus(property)]
@@ -51,9 +53,10 @@ trait LoginUser {
     fn display(&self) -> zbus::Result<(String, OwnedObjectPath)>;
 }
 
-/// A session's user and state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A session's id, user and state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionInfo {
+    pub id: String,
     pub uid: u32,
     pub state: Session,
 }
@@ -68,15 +71,16 @@ pub async fn session_by_id(connection: &Connection, id: &str) -> Result<SessionI
     session_at(connection, path).await
 }
 
-/// The session state of a process of user `uid`, whose cgroup is `cgroup`. A process in another
-/// user's session is not local, unless it is root's. A process in no session gets its user's
-/// display session only when it runs under that user's service manager.
+/// The session state of a process of user `uid`, whose cgroup is `cgroup`, and the id of the
+/// session it comes from (`None`: no session of the user's own). A process in another user's
+/// session is not local, unless it is root's. A process in no session gets its user's display
+/// session only when it runs under that user's service manager.
 pub async fn session_of_process(
     connection: &Connection,
     pid: u32,
     uid: u32,
     cgroup: &str,
-) -> Result<Session, String> {
+) -> Result<(Session, Option<String>), String> {
     let manager = manager(connection).await?;
     match manager.get_session_by_pid(pid).await {
         Ok(path) => {
@@ -85,15 +89,15 @@ pub async fn session_of_process(
             // process in the seat's session, while the user may be logged in only remotely
             // (docs/DESIGN.md, "Subjects"). Root keeps the state: `sudo` at the seat.
             if session.uid != uid && uid != 0 {
-                return Ok(Session::NotLocal);
+                return Ok((Session::NotLocal, None));
             }
-            return Ok(session.state);
+            return Ok((session.state, Some(session.id)));
         }
         Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == NO_SESSION_FOR_PID => {}
         Err(error) => return Err(format!("logind, session of process {pid}: {error}")),
     }
     if !is_under_user_manager(cgroup, uid) {
-        return Ok(Session::NotLocal);
+        return Ok((Session::NotLocal, None));
     }
     let user_path = manager
         .get_user(uid)
@@ -110,7 +114,7 @@ pub async fn session_of_process(
         .await
         .map_err(|error| format!("logind, user {uid}: {error}"))?;
     if display.is_empty() {
-        return Ok(Session::NotLocal);
+        return Ok((Session::NotLocal, None));
     }
     let display = session_at(connection, display_path).await?;
     // logind only names a session of the user as their display; checked all the same.
@@ -119,7 +123,7 @@ pub async fn session_of_process(
             "logind: the display session of user {uid} is not theirs"
         ));
     }
-    Ok(display.state)
+    Ok((display.state, Some(display.id)))
 }
 
 async fn manager(connection: &Connection) -> Result<ManagerProxy<'static>, String> {
@@ -138,11 +142,13 @@ async fn session_at(connection: &Connection, path: OwnedObjectPath) -> Result<Se
         .build()
         .await
         .map_err(failed)?;
+    let id = session.id().await.map_err(failed)?;
     let remote = session.remote().await.map_err(failed)?;
     let (seat, _) = session.seat().await.map_err(failed)?;
     let active = session.active().await.map_err(failed)?;
     let (uid, _) = session.user().await.map_err(failed)?;
     Ok(SessionInfo {
+        id,
         uid,
         state: Session::from_logind(remote, &seat, active),
     })

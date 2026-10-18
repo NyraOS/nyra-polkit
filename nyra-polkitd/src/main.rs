@@ -11,6 +11,7 @@ use nyra_polkitd::rules::{IMAGE_RULES_DIR, LOCAL_RULES_DIR};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
+use zbus::fdo::DBusProxy;
 
 /// How long a call to logind or to the bus may take; a check whose call times out is refused. Well
 /// under the 25 s that D-Bus clients usually wait, so they get the refusal rather than their own
@@ -69,19 +70,58 @@ async fn serve(directories: Directories) -> Result<(), String> {
     let authority = Authority::new(load_policy(&directories));
     let connection = zbus::connection::Builder::system()
         .map(|builder| builder.method_timeout(CALL_TIMEOUT))
-        .and_then(|builder| builder.serve_at(AUTHORITY_PATH, authority))
-        .and_then(|builder| builder.name(BUS_NAME))
         .map_err(|error| error.to_string())?
         .build()
         .await
-        .map_err(|error| format!("system bus, {BUS_NAME}: {error}"))?;
-    eprintln!("<6>serving {BUS_NAME}");
-
+        .map_err(|error| format!("system bus: {error}"))?;
+    // Connections that leave end their checks and remove their agents. Watched before anyone can
+    // call the authority, so no departure is missed.
+    let mut departures = DBusProxy::new(&connection)
+        .await
+        .map_err(|error| error.to_string())?
+        .receive_name_owner_changed()
+        .await
+        .map_err(|error| format!("NameOwnerChanged: {error}"))?
+        .filter_map(|signal| {
+            let args = signal.args().ok()?;
+            let unique = args.name().as_str().starts_with(':');
+            (unique && args.new_owner().is_none()).then(|| args.name().to_string())
+        });
+    connection
+        .object_server()
+        .at(AUTHORITY_PATH, authority)
+        .await
+        .map_err(|error| error.to_string())?;
     let authority = connection
         .object_server()
         .interface::<_, Authority>(AUTHORITY_PATH)
         .await
         .map_err(|error| error.to_string())?;
+    // Read from now on, in a task of its own: zbus holds every message of the connection, replies
+    // included, while a stream is full, so a stream read only later could stall the RequestName
+    // below and everything after it.
+    let departed = authority.clone();
+    connection
+        .executor()
+        .spawn(
+            async move {
+                while let Some(name) = departures.next().await {
+                    if departed.get().await.connection_left(&name) {
+                        if let Err(error) = Authority::changed(departed.signal_emitter()).await {
+                            eprintln!("<4>Changed signal: {error}");
+                        }
+                    }
+                }
+            },
+            "departures",
+        )
+        .detach();
+    connection
+        .request_name(BUS_NAME)
+        .await
+        .map_err(|error| format!("system bus, {BUS_NAME}: {error}"))?;
+    eprintln!("<6>serving {BUS_NAME}");
+
     while hangups.next().await.is_some() {
         eprintln!("<6>reloading the action files and the rules");
         authority

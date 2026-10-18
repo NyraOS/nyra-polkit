@@ -23,10 +23,63 @@ use zbus::names::BusName;
 use zbus::zvariant::{OwnedValue, Value};
 
 /// A subject once identified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identified {
     pub uid: u32,
     pub session: Session,
+    /// The logind session the state comes from; `None` when the subject has no session of its own
+    /// (none at all, or another user's).
+    pub session_id: Option<String>,
+    /// The exact subject: what agents are registered for and temporary authorizations are kept for.
+    pub key: SubjectKey,
+    /// The subject's process (for a bus name, the connection's); `None` for a session.
+    pub process: Option<ProcessId>,
+}
+
+/// One exact subject. A process is its PID and start time: the PID alone may be reused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubjectKey {
+    BusName(String),
+    Process(ProcessId),
+    Session(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessId {
+    pub pid: u32,
+    pub start_time: u64,
+}
+
+impl SubjectKey {
+    /// The subject as the interface sends it, `(sa{sv})`.
+    pub fn to_wire(&self) -> (String, HashMap<String, OwnedValue>) {
+        let (kind, details): (&str, Vec<(&str, Value)>) = match self {
+            Self::BusName(name) => (
+                "system-bus-name",
+                vec![("name", Value::from(name.as_str()))],
+            ),
+            Self::Process(process) => (
+                "unix-process",
+                vec![
+                    ("pid", Value::U32(process.pid)),
+                    ("start-time", Value::U64(process.start_time)),
+                ],
+            ),
+            Self::Session(id) => (
+                "unix-session",
+                vec![("session-id", Value::from(id.as_str()))],
+            ),
+        };
+        let details = details
+            .into_iter()
+            .map(|(key, value)| {
+                // Plain numbers and strings: never a file descriptor, so this cannot fail.
+                let value = OwnedValue::try_from(value).expect("a plain value");
+                (key.to_string(), value)
+            })
+            .collect();
+        (kind.to_string(), details)
+    }
 }
 
 /// How the client pins the process of a `unix-process` subject.
@@ -87,13 +140,26 @@ pub async fn identify(
                 return Err(format!("{name:?} is not a unique bus name"));
             }
             let (uid, pidfd) = bus_peer(connection, &name).await?;
-            let (process, cgroup) = blocking::unblock(move || {
+            let (process, start_time, cgroup) = blocking::unblock(move || {
                 let process = Process::from_pidfd(pidfd)?;
+                let start_time = process.start_time()?;
                 let cgroup = process.cgroup()?;
-                Ok::<_, String>((process, cgroup))
+                Ok::<_, String>((process, start_time, cgroup))
             })
             .await?;
-            process_subject(connection, uid, process, &cgroup).await
+            let process_id = ProcessId {
+                pid: process.pid(),
+                start_time,
+            };
+            process_subject(
+                connection,
+                uid,
+                process,
+                process_id,
+                &cgroup,
+                SubjectKey::BusName(name),
+            )
+            .await
         }
         "unix-process" => {
             let pid: u32 = detail(details, "pid")?;
@@ -103,9 +169,18 @@ pub async fn identify(
             };
             // The uid the client saw, when it sends one (-1: it did not know).
             let seen_uid = optional_uid(details)?;
-            let (process, uid, cgroup) =
+            let (process, start_time, uid, cgroup) =
                 blocking::unblock(move || read_unix_process(pid, pin, seen_uid)).await?;
-            process_subject(connection, uid, process, &cgroup).await
+            let process_id = ProcessId { pid, start_time };
+            process_subject(
+                connection,
+                uid,
+                process,
+                process_id,
+                &cgroup,
+                SubjectKey::Process(process_id),
+            )
+            .await
         }
         "unix-session" => {
             let id: String = detail(details, "session-id")?;
@@ -113,26 +188,30 @@ pub async fn identify(
             Ok(Identified {
                 uid: session.uid,
                 session: session.state,
+                session_id: Some(session.id),
+                key: SubjectKey::Session(id),
+                process: None,
             })
         }
         other => Err(format!("unsupported subject kind {other:?}")),
     }
 }
 
-/// Pins the process of a `unix-process` subject and reads its real uid and its cgroup. Blocking
-/// (`/proc`): call it as a blocking task.
+/// Pins the process of a `unix-process` subject and reads its start time, its real uid and its
+/// cgroup. Blocking (`/proc`): call it as a blocking task.
 fn read_unix_process(
     pid: u32,
     pin: Pin,
     seen_uid: Option<u32>,
-) -> Result<(Process, u32, String), String> {
-    let process = match pin {
+) -> Result<(Process, u64, u32, String), String> {
+    let (process, start_time) = match pin {
         Pin::Pidfd(pidfd) => {
             let process = Process::from_pidfd(pidfd)?;
             if process.pid() != pid {
                 return Err(format!("pid {pid} is not the pidfd's process"));
             }
-            process
+            let start_time = process.start_time()?;
+            (process, start_time)
         }
         Pin::StartTime(start_time) => {
             let process = Process::open(pid)?;
@@ -142,7 +221,7 @@ fn read_unix_process(
                     "process {pid}: the start time does not match (PID reused or not given)"
                 ));
             }
-            process
+            (process, start_time)
         }
     };
     let uid = process.real_uid()?;
@@ -154,7 +233,7 @@ fn read_unix_process(
         }
     }
     let cgroup = process.cgroup()?;
-    Ok((process, uid, cgroup))
+    Ok((process, start_time, uid, cgroup))
 }
 
 /// The session of a pinned process of user `uid`; everything is read before the last check that
@@ -163,11 +242,20 @@ async fn process_subject(
     connection: &Connection,
     uid: u32,
     process: Process,
+    process_id: ProcessId,
     cgroup: &str,
+    key: SubjectKey,
 ) -> Result<Identified, String> {
-    let session = logind::session_of_process(connection, process.pid(), uid, cgroup).await?;
+    let (session, session_id) =
+        logind::session_of_process(connection, process.pid(), uid, cgroup).await?;
     process.ensure_alive()?;
-    Ok(Identified { uid, session })
+    Ok(Identified {
+        uid,
+        session,
+        session_id,
+        key,
+        process: Some(process_id),
+    })
 }
 
 /// A required detail of a given D-Bus type.
@@ -236,6 +324,28 @@ pub fn user_and_groups(uid: u32) -> Result<(String, Vec<String>), String> {
     Ok((user.name, groups))
 }
 
+/// The uids of the administrators: the listed users and the members of the listed groups (the
+/// group's member list in the user database), sorted, without repeats. Names the user database does
+/// not know are skipped: nobody can authenticate as them. Blocking (NSS): call it as a blocking
+/// task.
+pub fn administrator_uids(users: &[String], groups: &[String]) -> Vec<u32> {
+    use nix::unistd::{Group, User};
+    let mut names: Vec<String> = users.to_vec();
+    for group in groups {
+        if let Ok(Some(group)) = Group::from_name(group) {
+            names.extend(group.mem);
+        }
+    }
+    let mut uids: Vec<u32> = names
+        .iter()
+        .filter_map(|name| User::from_name(name).ok().flatten())
+        .map(|user| user.uid.as_raw())
+        .collect();
+    uids.sort_unstable();
+    uids.dedup();
+    uids
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +382,43 @@ mod tests {
         assert_eq!(detail::<u32>(&subject, "pid"), Ok(42));
         assert!(detail::<u64>(&subject, "start-time").is_err());
         assert!(detail::<String>(&subject, "name").is_err());
+    }
+
+    #[test]
+    fn subjects_go_back_on_the_wire_as_the_interface_sends_them() {
+        let (kind, details) = SubjectKey::Process(ProcessId {
+            pid: 42,
+            start_time: 7,
+        })
+        .to_wire();
+        assert_eq!(kind, "unix-process");
+        assert_eq!(detail::<u32>(&details, "pid"), Ok(42));
+        assert_eq!(detail::<u64>(&details, "start-time"), Ok(7));
+        let (kind, details) = SubjectKey::BusName(":1.5".to_string()).to_wire();
+        assert_eq!(kind, "system-bus-name");
+        assert_eq!(detail::<String>(&details, "name"), Ok(":1.5".to_string()));
+        let (kind, details) = SubjectKey::Session("c1".to_string()).to_wire();
+        assert_eq!(kind, "unix-session");
+        assert_eq!(
+            detail::<String>(&details, "session-id"),
+            Ok("c1".to_string())
+        );
+    }
+
+    #[test]
+    fn administrators_are_listed_users_and_group_members() {
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        // root twice and a user nobody has: root once.
+        assert_eq!(
+            administrator_uids(&names(&["root", "no-such-user", "root"]), &[]),
+            vec![0]
+        );
+        assert!(administrator_uids(&[], &names(&["no-such-group"])).is_empty());
     }
 
     #[test]
