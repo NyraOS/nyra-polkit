@@ -9,7 +9,7 @@
 
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 pub struct Process {
     pidfd: OwnedFd,
@@ -43,6 +43,11 @@ impl Process {
 
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// The pidfd, for a client that passes the pinned process on (pkcheck sends it in its subject).
+    pub fn pidfd(&self) -> BorrowedFd<'_> {
+        self.pidfd.as_fd()
     }
 
     /// When the process started, in clock ticks since boot (field 22 of `/proc/<pid>/stat`): with
