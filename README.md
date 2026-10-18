@@ -42,9 +42,9 @@ it.
 Early work. What exists today: the design ([`docs/DESIGN.md`](docs/DESIGN.md)) and `nyra-polkitd`,
 which owns `org.freedesktop.PolicyKit1` on the system bus, reads the standard action files
 (`/usr/share/polkit-1/actions`) and the TOML rules, and answers `CheckAuthorization` and
-`EnumerateActions`. Authentication agents are not served yet: an action that needs a password is
-answered "not authorized, challenge" (pkcheck's exit code 2). The files that install it (systemd
-unit, bus policy and activation, system user) are in [`dist/`](dist).
+`EnumerateActions`. It serves authentication agents (the dialog that asks for a password) and
+keeps temporary authorizations (`auth_self_keep`, `auth_admin_keep`) for five minutes. The files
+that install it (systemd unit, bus policy and activation, system user) are in [`dist/`](dist).
 
 **It is not a drop-in replacement for polkit:** JavaScript `.rules` files are not read, and
 `pkexec` is not provided. Password checks stay with polkit's own `polkit-agent-helper-1`.
@@ -57,8 +57,9 @@ cargo test
 ```
 
 The D-Bus integration tests run nyra-polkitd on a private bus and need root, a writable
-`/sys/fs/cgroup`, `dbus-daemon`, `pkcheck`, `busctl` and the `polkitd` user (Debian 13: the
-`dbus-daemon`, `polkitd` and `systemd` packages); CI runs them in a privileged Debian 13 container:
+`/sys/fs/cgroup`, `dbus-daemon`, `pkcheck`, `busctl` and the `polkitd`, `nobody` and `daemon`
+users (Debian 13: the `dbus-daemon`, `polkitd` and `systemd` packages); CI runs them in a
+privileged Debian 13 container:
 
 ```sh
 cargo test --test dbus -- --ignored

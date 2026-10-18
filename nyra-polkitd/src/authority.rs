@@ -1,25 +1,31 @@
 // SPDX-License-Identifier: MIT
 //! The D-Bus service: `org.freedesktop.PolicyKit1.Authority` at [`AUTHORITY_PATH`]
-//! (docs/DESIGN.md, "D-Bus interface").
+//! (docs/DESIGN.md, "D-Bus interface"): checks, authentication agents and temporary
+//! authorizations.
 //!
-//! Authentication agents are not served yet: a decision that needs authentication (`auth_*`) is
-//! answered "not authorized, challenge", which is what the interface documents when no agent can
-//! take the request.
+//! A decision that needs authentication (`auth_*`) goes to the subject's agent when the caller
+//! allows user interaction and one is registered; otherwise it is answered "not authorized,
+//! challenge".
 //!
 //! Log lines carry sd-daemon priority prefixes for the journal: `<3>` error, `<4>` warning,
 //! `<6>` info.
 
 use crate::actions::{Actions, load_actions};
-use crate::decision::{Subject, decide};
+use crate::agents::{self, Agent, Agents, Cookies};
+use crate::decision::{Subject, decide, is_administrator};
 use crate::rules::{Rules, load_rules};
+use crate::subject::Identified;
+use crate::temporary::{TemporaryAuthorizations, boot_clock};
 use crate::{Authorization, subject};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
+use zbus::fdo::DBusProxy;
 use zbus::message::Header;
+use zbus::names::BusName;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::OwnedValue;
+use zbus::zvariant::{ObjectPath, OwnedValue};
 use zbus::{Connection, interface};
 
 pub const BUS_NAME: &str = "org.freedesktop.PolicyKit1";
@@ -47,6 +53,8 @@ const DOCUMENTED_POLKIT_DETAILS: [&str; 3] = [
 ];
 /// The action annotation naming the users who may check other users' subjects (polkit(8)).
 const OWNER_ANNOTATION: &str = "org.freedesktop.policykit.owner";
+/// What the agent says when the user dismissed the dialog.
+const AGENT_CANCELLED: &str = "org.freedesktop.PolicyKit1.Error.Cancelled";
 
 /// The errors of the interface, `org.freedesktop.PolicyKit1.Error.*`.
 #[derive(Debug, zbus::DBusError)]
@@ -69,6 +77,12 @@ pub struct AuthorizationResult {
     is_challenge: bool,
     details: HashMap<String, String>,
 }
+
+/// A subject or an identity on the wire, `(sa{sv})`.
+type Wire = (String, HashMap<String, OwnedValue>);
+
+/// `TemporaryAuthorization`: id, action id, subject, obtained and expires (seconds since the epoch).
+type TemporaryAuthorizationWire = (String, String, Wire, u64, u64);
 
 /// `ActionDescription`: id, description, message, vendor name, vendor URL, icon name, the three
 /// implicit authorizations (any, inactive, active) and the annotations.
@@ -136,27 +150,62 @@ struct ChecksInFlight {
     by_user: HashMap<u32, usize>,
 }
 
-#[derive(Default)]
 struct CallerChecks {
     count: usize,
     cancellable: HashMap<String, async_channel::Sender<()>>,
+    /// Never sent on, only kept: dropped with this when the caller leaves the bus, which closes
+    /// the channel and so ends every check of the caller.
+    _left: async_channel::Sender<()>,
+    left_receiver: async_channel::Receiver<()>,
+}
+
+impl Default for CallerChecks {
+    fn default() -> Self {
+        let (left, left_receiver) = async_channel::bounded(1);
+        Self {
+            count: 0,
+            cancellable: HashMap::new(),
+            _left: left,
+            left_receiver,
+        }
+    }
+}
+
+/// What ends a check before its answer: `CancelCheckAuthorization` with its id, if it has one, or
+/// its caller leaving the bus.
+struct Cancellation {
+    by_id: Option<async_channel::Receiver<()>>,
+    caller_left: async_channel::Receiver<()>,
+}
+
+impl Cancellation {
+    async fn wait(self) {
+        let by_id = async {
+            match self.by_id {
+                Some(cancelled) => {
+                    let _ = cancelled.recv().await;
+                }
+                None => futures_lite::future::pending::<()>().await,
+            }
+        };
+        // Err once the channel is closed: the caller left.
+        let caller_left = async {
+            let _ = self.caller_left.recv().await;
+        };
+        futures_lite::future::or(by_id, caller_left).await;
+    }
 }
 
 impl ChecksInFlight {
-    /// Counts a new check of `caller`. With a cancellation id, returns what receives the
-    /// cancellation.
-    fn begin(
-        &mut self,
-        caller: &str,
-        cancellation_id: &str,
-    ) -> Result<Option<async_channel::Receiver<()>>, Error> {
+    /// Counts a new check of `caller`; returns what ends it early.
+    fn begin(&mut self, caller: &str, cancellation_id: &str) -> Result<Cancellation, Error> {
         let checks = self.by_caller.entry(caller.to_string()).or_default();
         if checks.count >= MAX_CHECKS_PER_CONNECTION {
             return Err(Error::Failed(format!(
                 "too many checks in flight (at most {MAX_CHECKS_PER_CONNECTION} per connection)"
             )));
         }
-        let mut cancelled = None;
+        let mut by_id = None;
         if !cancellation_id.is_empty() {
             if checks.cancellable.contains_key(cancellation_id) {
                 return Err(Error::CancellationIdNotUnique(format!(
@@ -167,10 +216,18 @@ impl ChecksInFlight {
             checks
                 .cancellable
                 .insert(cancellation_id.to_string(), sender);
-            cancelled = Some(receiver);
+            by_id = Some(receiver);
         }
         checks.count += 1;
-        Ok(cancelled)
+        Ok(Cancellation {
+            by_id,
+            caller_left: checks.left_receiver.clone(),
+        })
+    }
+
+    /// Ends every check of a caller that left the bus.
+    fn caller_left(&mut self, caller: &str) {
+        self.by_caller.remove(caller);
     }
 
     fn end(&mut self, caller: &str, cancellation_id: &str) {
@@ -280,10 +337,40 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// An authentication in flight: when the check ends, however it ends, its cookie is forgotten, and
+/// an agent still showing the dialog is told to close it (the check was cancelled, or its caller
+/// left).
+struct AgentDialog<'a> {
+    cookies: &'a Mutex<Cookies>,
+    cookie: String,
+    connection: Connection,
+    agent: Agent,
+    agent_returned: bool,
+}
+
+impl Drop for AgentDialog<'_> {
+    fn drop(&mut self) {
+        lock(self.cookies).finish(&self.cookie);
+        if !self.agent_returned {
+            agents::cancel_authentication(&self.connection, &self.agent, self.cookie.clone());
+        }
+    }
+}
+
+/// How an authentication ended.
+enum Authenticated {
+    As(u32),
+    Dismissed,
+    Failed,
+}
+
 pub struct Authority {
     policy: RwLock<Policy>,
     checks: Mutex<ChecksInFlight>,
     broken_rules_log: Mutex<BrokenRulesLog>,
+    agents: Mutex<Agents>,
+    cookies: Mutex<Cookies>,
+    temporary: Mutex<TemporaryAuthorizations>,
 }
 
 impl Authority {
@@ -292,15 +379,38 @@ impl Authority {
             policy: RwLock::new(policy),
             checks: Mutex::default(),
             broken_rules_log: Mutex::default(),
+            agents: Mutex::default(),
+            cookies: Mutex::default(),
+            temporary: Mutex::default(),
         }
     }
 
-    /// Replaces the policy in force (`systemctl reload`).
+    /// Replaces the policy in force (`systemctl reload`). The temporary authorizations go with
+    /// the old rules: they were granted under them.
     pub fn replace_policy(&self, policy: Policy) {
         *self
             .policy
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+        let dropped = lock(&self.temporary).clear();
+        if dropped > 0 {
+            eprintln!("<6>{dropped} temporary authorizations revoked: the rules were reread");
+        }
+    }
+
+    /// A connection left the bus: its checks end (an agent showing a dialog for one is told to
+    /// close it), its agents are removed, and so are the temporary authorizations of its bus name.
+    /// Returns whether any temporary authorization was removed (then `Changed` is due).
+    pub fn connection_left(&self, name: &str) -> bool {
+        lock(&self.checks).caller_left(name);
+        for agent in lock(&self.agents).connection_left(name) {
+            log_agent("removed (its connection left the bus)", &agent);
+        }
+        let revoked = lock(&self.temporary).bus_name_left(name);
+        if revoked > 0 {
+            eprintln!("<6>{revoked} temporary authorizations of {name} revoked: it left the bus");
+        }
+        revoked > 0
     }
 
     fn read_policy(&self) -> std::sync::RwLockReadGuard<'_, Policy> {
@@ -309,13 +419,16 @@ impl Authority {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[allow(clippy::too_many_arguments)] // CheckAuthorization's arguments, plus the call's context.
     async fn check(
         &self,
         connection: &Connection,
+        emitter: &SignalEmitter<'_>,
         caller: &str,
-        (kind, subject_details): (String, HashMap<String, OwnedValue>),
+        (kind, subject_details): Wire,
         action_id: &str,
         details: HashMap<String, String>,
+        flags: u32,
     ) -> Result<AuthorizationResult, Error> {
         let caller_uid = subject::bus_uid(connection, caller)
             .await
@@ -341,6 +454,11 @@ impl Authority {
         let (user, groups) = blocking::unblock(move || subject::user_and_groups(uid))
             .await
             .map_err(not_identified)?;
+        let subject = Subject {
+            user,
+            groups,
+            session: identified.session,
+        };
 
         if identified.uid != caller_uid && caller_uid != 0 {
             let caller_name = blocking::unblock(move || subject::user_name(caller_uid)).await;
@@ -351,42 +469,308 @@ impl Authority {
                 ));
             }
         }
-        let policy = self.read_policy();
-        let rules = match &policy.rules {
-            Ok(rules) => rules,
-            Err(error) => {
-                if let Some(denied) = lock(&self.broken_rules_log).denied(Instant::now()) {
-                    eprintln!(
-                        "<3>the rules are broken, so every check is denied ({denied} since the last message): {error}"
-                    );
+        // What the decision needs from the policy is taken here: the lock is not held across the
+        // waits that follow.
+        let (decision, message, icon_name, administrators) = {
+            let policy = self.read_policy();
+            let rules = match &policy.rules {
+                Ok(rules) => rules,
+                Err(error) => {
+                    if let Some(denied) = lock(&self.broken_rules_log).denied(Instant::now()) {
+                        eprintln!(
+                            "<3>the rules are broken, so every check is denied ({denied} since the last message): {error}"
+                        );
+                    }
+                    return Ok(answer(Authorization::No));
                 }
-                return Ok(answer(Authorization::No));
+            };
+            let sorted_details: std::collections::BTreeMap<_, _> = details
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let decision = decide(&policy.actions, rules, action_id, &subject, &sorted_details);
+            let action = policy.actions.get(action_id);
+            (
+                decision,
+                action.map(|action| action.message.clone()),
+                action.map(|action| action.icon_name.clone()),
+                rules.administrators.clone(),
+            )
+        };
+        if matches!(decision, Authorization::Yes | Authorization::No) {
+            return Ok(answer(decision));
+        }
+        let keep = matches!(
+            decision,
+            Authorization::AuthSelfKeep | Authorization::AuthAdminKeep
+        );
+        if let Some(id) = lock(&self.temporary).find(action_id, &identified, decision, boot_clock())
+        {
+            eprintln!(
+                "<6>temporary authorization {id} used for {action_id} of user {}",
+                identified.uid
+            );
+            return Ok(authorized_by(&id));
+        }
+        let challenge = || {
+            let mut result = answer(decision);
+            if keep {
+                result.details.insert(
+                    "polkit.retains_authorization_after_challenge".to_string(),
+                    "true".to_string(),
+                );
+            }
+            result
+        };
+        if flags & ALLOW_USER_INTERACTION == 0 {
+            return Ok(challenge());
+        }
+        let Some(agent) = lock(&self.agents).for_subject(&identified) else {
+            return Ok(challenge());
+        };
+
+        // auth_self: the subject's user. auth_admin: an administrator; the subject's user if they
+        // are one.
+        let identities = if matches!(
+            decision,
+            Authorization::AuthSelf | Authorization::AuthSelfKeep
+        ) || is_administrator(&subject, &administrators)
+        {
+            vec![identified.uid]
+        } else {
+            blocking::unblock(move || {
+                subject::administrator_uids(&administrators.users, &administrators.groups)
+            })
+            .await
+        };
+        if identities.is_empty() {
+            eprintln!(
+                "<4>{action_id} for user {}: no administrator can authenticate, so it is denied",
+                identified.uid
+            );
+            return Ok(answer(Authorization::No));
+        }
+        // A root caller may give the dialog its own text (`polkit.message`, `polkit.icon_name`:
+        // only root may pass them, see check_details).
+        let message = match details.get("polkit.message") {
+            Some(message) => message.clone(),
+            None => message
+                .map(|message| message.for_locale(&agent.locale).to_string())
+                .unwrap_or_default(),
+        };
+        let icon_name = details
+            .get("polkit.icon_name")
+            .cloned()
+            .or(icon_name)
+            .unwrap_or_default();
+        let request = agents::Request {
+            action_id,
+            message: &message,
+            icon_name: &icon_name,
+            details: &details,
+            identities: &identities,
+        };
+        match self
+            .authenticate(connection, &agent, &identified, &request)
+            .await?
+        {
+            Authenticated::As(_) if keep => {
+                let id = lock(&self.temporary).add(action_id, &identified, decision, boot_clock());
+                eprintln!(
+                    "<6>temporary authorization {id} created for {action_id} of user {}",
+                    identified.uid
+                );
+                if let Err(error) = Authority::changed(emitter).await {
+                    eprintln!("<4>Changed signal: {error}");
+                }
+                let mut result = authorized_by(&id);
+                result.details.insert(
+                    "polkit.retains_authorization_after_challenge".to_string(),
+                    "true".to_string(),
+                );
+                Ok(result)
+            }
+            Authenticated::As(_) => Ok(answer(Authorization::Yes)),
+            Authenticated::Dismissed => {
+                let mut result = answer(Authorization::No);
+                result
+                    .details
+                    .insert("polkit.dismissed".to_string(), "true".to_string());
+                Ok(result)
+            }
+            Authenticated::Failed => Ok(answer(Authorization::No)),
+        }
+    }
+
+    /// Runs one authentication through `agent`, once the agent is free: it is authenticated only if
+    /// `AuthenticationAgentResponse2` was accepted for its cookie and the agent then returned.
+    async fn authenticate(
+        &self,
+        connection: &Connection,
+        agent: &Agent,
+        subject: &Identified,
+        request: &agents::Request<'_>,
+    ) -> Result<Authenticated, Error> {
+        let _turn = agent.busy.lock().await;
+        let cookie = lock(&self.cookies)
+            .add(agent.uid, request.identities.to_vec())
+            .map_err(|error| {
+                eprintln!("<3>{error}");
+                Error::Failed("cannot start an authentication".to_string())
+            })?;
+        let mut dialog = AgentDialog {
+            cookies: &self.cookies,
+            cookie: cookie.clone(),
+            connection: connection.clone(),
+            agent: agent.clone(),
+            agent_returned: false,
+        };
+        let pid = subject.process.map(|process| process.pid);
+        eprintln!(
+            "<6>authentication for {} of user {} (process {pid:?}) through the agent of {}, identities {:?}",
+            request.action_id, subject.uid, agent.connection, request.identities
+        );
+        let returned = agents::begin_authentication(connection, agent, request, &cookie).await;
+        dialog.agent_returned = true;
+        let authenticated = lock(&self.cookies).finish(&cookie);
+        let outcome = match (returned, authenticated) {
+            (Ok(()), Some(identity)) => Authenticated::As(identity),
+            (Err(zbus::Error::MethodError(name, _, _)), _) if name.as_str() == AGENT_CANCELLED => {
+                Authenticated::Dismissed
+            }
+            (Ok(()), None) => {
+                eprintln!(
+                    "<4>the agent of {} returned without an authentication",
+                    agent.connection
+                );
+                Authenticated::Failed
+            }
+            (Err(error), _) => {
+                eprintln!("<4>the agent of {}: {error}", agent.connection);
+                Authenticated::Failed
             }
         };
-        let details: std::collections::BTreeMap<_, _> = details.into_iter().collect();
-        let subject = Subject {
-            user,
-            groups,
-            session: identified.session,
+        let result = match outcome {
+            Authenticated::As(identity) => format!("authorized, as uid {identity}"),
+            Authenticated::Dismissed => "dismissed".to_string(),
+            Authenticated::Failed => "failed".to_string(),
         };
-        Ok(answer(decide(
-            &policy.actions,
-            rules,
-            action_id,
-            &subject,
-            &details,
-        )))
+        eprintln!(
+            "<6>authentication for {} of user {} (process {pid:?}): {result}",
+            request.action_id, subject.uid
+        );
+        Ok(outcome)
+    }
+
+    /// The caller's uid, as the bus knows it.
+    async fn caller_uid(&self, connection: &Connection, caller: &str) -> Result<u32, Error> {
+        subject::bus_uid(connection, caller).await.map_err(|error| {
+            eprintln!("<4>call from {caller}: {error}");
+            Error::Failed("cannot identify the caller".to_string())
+        })
+    }
+
+    /// Identifies `subject` for a caller that may only name its own subjects (root: anyone's).
+    async fn own_subject(
+        &self,
+        connection: &Connection,
+        caller: &str,
+        (kind, details): Wire,
+    ) -> Result<(Identified, u32), Error> {
+        let caller_uid = self.caller_uid(connection, caller).await?;
+        let identified = subject::identify(connection, &kind, &details)
+            .await
+            .map_err(|error| {
+                eprintln!("<4>call from {caller}: {SUBJECT_NOT_IDENTIFIED}: {error}");
+                Error::NotAuthorized(SUBJECT_NOT_IDENTIFIED.to_string())
+            })?;
+        if identified.uid != caller_uid && caller_uid != 0 {
+            return Err(Error::NotAuthorized(
+                "the subject belongs to another user".to_string(),
+            ));
+        }
+        Ok((identified, caller_uid))
+    }
+
+    async fn register_agent(
+        &self,
+        connection: &Connection,
+        caller: &str,
+        subject: Wire,
+        locale: String,
+        path: String,
+        fallback: bool,
+    ) -> Result<(), Error> {
+        let (identified, caller_uid) = self.own_subject(connection, caller, subject).await?;
+        // Not even root registers for another user: an agent authenticates for its own user.
+        if identified.uid != caller_uid {
+            return Err(Error::NotAuthorized(
+                "an agent may only be registered for a subject of its own user".to_string(),
+            ));
+        }
+        if ObjectPath::try_from(path.as_str()).is_err() {
+            return Err(Error::Failed(format!("{path:?} is not an object path")));
+        }
+        let agent = Agent {
+            connection: caller.to_string(),
+            path,
+            uid: caller_uid,
+            subject: identified.key,
+            locale,
+            fallback,
+            busy: Default::default(),
+        };
+        lock(&self.agents)
+            .register(agent.clone())
+            .map_err(Error::Failed)?;
+        // The caller may have left while it was identified, and its leaving then found no agent to
+        // remove. Asked after the agent was added: if the caller is still there, its leaving comes
+        // later and removes it.
+        let still_there = match BusName::try_from(caller) {
+            Ok(name) => match DBusProxy::new(connection).await {
+                Ok(proxy) => proxy.name_has_owner(name).await.unwrap_or(false),
+                Err(_) => false,
+            },
+            Err(_) => false,
+        };
+        if !still_there {
+            lock(&self.agents).connection_left(caller);
+            return Err(Error::Failed("the caller left the bus".to_string()));
+        }
+        log_agent("registered", &agent);
+        Ok(())
     }
 }
 
-/// What a decision answers before any authentication. `auth_*` is a challenge: the subject could
-/// be authorized by authenticating, and no agent can take the request yet.
+fn log_agent(what: &str, agent: &Agent) {
+    eprintln!(
+        "<6>authentication agent {what}: user {}, for {:?}, {} {}{}",
+        agent.uid,
+        agent.subject,
+        agent.connection,
+        agent.path,
+        if agent.fallback { ", fallback" } else { "" }
+    );
+}
+
+/// What a decision answers without authenticating. `auth_*` is a challenge: the subject could be
+/// authorized by authenticating.
 fn answer(authorization: Authorization) -> AuthorizationResult {
     AuthorizationResult {
         is_authorized: authorization == Authorization::Yes,
         is_challenge: !matches!(authorization, Authorization::Yes | Authorization::No),
         details: HashMap::new(),
     }
+}
+
+/// Authorized by the temporary authorization `id`.
+fn authorized_by(id: &str) -> AuthorizationResult {
+    let mut result = answer(Authorization::Yes);
+    result.details.insert(
+        "polkit.temporary_authorization_id".to_string(),
+        id.to_string(),
+    );
+    result
 }
 
 /// `polkit.` details are refused unless documented, and those only from root.
@@ -443,10 +827,10 @@ impl Authority {
         env!("CARGO_PKG_VERSION")
     }
 
-    /// No `TemporaryAuthorization` (1) until authentication is served.
+    /// `TemporaryAuthorization` (1).
     #[zbus(property)]
     fn backend_features(&self) -> u32 {
-        0
+        1
     }
 
     #[zbus(signal)]
@@ -481,7 +865,8 @@ impl Authority {
         &self,
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] connection: &Connection,
-        subject: (String, HashMap<String, OwnedValue>),
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        subject: Wire,
         action_id: String,
         details: HashMap<String, String>,
         flags: u32,
@@ -494,20 +879,17 @@ impl Authority {
         if flags & !ALLOW_USER_INTERACTION != 0 {
             return Err(Error::Failed(format!("unknown flags {flags:#x}")));
         }
-        let cancelled = lock(&self.checks).begin(&caller, &cancellation_id)?;
+        let cancellation = lock(&self.checks).begin(&caller, &cancellation_id)?;
         let _in_flight = InFlight {
             checks: &self.checks,
             caller: caller.clone(),
             cancellation_id: cancellation_id.clone(),
         };
-        let check = self.check(connection, &caller, subject, &action_id, details);
+        let check = self.check(
+            connection, &emitter, &caller, subject, &action_id, details, flags,
+        );
         let cancellation = async {
-            match cancelled {
-                Some(cancelled) => {
-                    let _ = cancelled.recv().await;
-                }
-                None => futures_lite::future::pending::<()>().await,
-            }
+            cancellation.wait().await;
             Err(Error::Cancelled("the check was cancelled".to_string()))
         };
         futures_lite::future::or(check, cancellation)
@@ -531,6 +913,169 @@ impl Authority {
             )))
         }
     }
+
+    async fn register_authentication_agent(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        subject: Wire,
+        locale: String,
+        object_path: String,
+    ) -> Result<(), Error> {
+        let caller = sender(&header)?;
+        self.register_agent(connection, &caller, subject, locale, object_path, false)
+            .await
+    }
+
+    /// Options: `fallback` (`b`). Others are ignored, as a later version of the interface may add
+    /// some.
+    async fn register_authentication_agent_with_options(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        subject: Wire,
+        locale: String,
+        object_path: String,
+        options: HashMap<String, OwnedValue>,
+    ) -> Result<(), Error> {
+        let caller = sender(&header)?;
+        let fallback = match options.get("fallback").map(|value| &**value) {
+            None => false,
+            Some(zbus::zvariant::Value::Bool(fallback)) => *fallback,
+            Some(_) => return Err(Error::Failed("the option fallback is not a boolean".into())),
+        };
+        self.register_agent(connection, &caller, subject, locale, object_path, fallback)
+            .await
+    }
+
+    async fn unregister_authentication_agent(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        subject: Wire,
+        object_path: String,
+    ) -> Result<(), Error> {
+        let caller = sender(&header)?;
+        let (identified, _) = self.own_subject(connection, &caller, subject).await?;
+        let removed = lock(&self.agents).unregister(&caller, &identified.key, &object_path);
+        match removed {
+            Some(agent) => {
+                log_agent("unregistered", &agent);
+                Ok(())
+            }
+            None => Err(Error::Failed(
+                "no such authentication agent registered by this connection".to_string(),
+            )),
+        }
+    }
+
+    /// The old answer, without the uid of the agent's user: refused (docs/DESIGN.md, "Scope").
+    fn authentication_agent_response(&self, _cookie: String, _identity: Wire) -> Result<(), Error> {
+        Err(Error::NotSupported(
+            "AuthenticationAgentResponse is not supported: use AuthenticationAgentResponse2"
+                .to_string(),
+        ))
+    }
+
+    /// The helper's answer, after it checked the password: accepted only from root, for a pending
+    /// cookie, the agent's user and an identity offered.
+    async fn authentication_agent_response2(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        uid: u32,
+        cookie: String,
+        identity: Wire,
+    ) -> Result<(), Error> {
+        let caller = sender(&header)?;
+        let caller_uid = self.caller_uid(connection, &caller).await?;
+        let identity_uid = agents::unix_user(&identity);
+        let response = lock(&self.cookies).respond(caller_uid, uid, &cookie, identity_uid);
+        match response {
+            Ok(identity) => {
+                eprintln!("<6>authentication answered by {caller}: uid {identity}");
+                Ok(())
+            }
+            Err(refusal) => {
+                eprintln!(
+                    "<4>AuthenticationAgentResponse2 from {caller} (uid {caller_uid}) refused: {refusal}"
+                );
+                if caller_uid != 0 {
+                    return Err(Error::NotAuthorized(
+                        "only root may answer an authentication".to_string(),
+                    ));
+                }
+                Err(Error::Failed(format!("refused: {refusal}")))
+            }
+        }
+    }
+
+    async fn enumerate_temporary_authorizations(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        subject: Wire,
+    ) -> Result<Vec<TemporaryAuthorizationWire>, Error> {
+        let caller = sender(&header)?;
+        let (identified, _) = self.own_subject(connection, &caller, subject).await?;
+        let now = boot_clock();
+        let kept = lock(&self.temporary).of_subject(&identified, now);
+        Ok(kept.iter().map(|kept| kept.to_wire(now)).collect())
+    }
+
+    async fn revoke_temporary_authorizations(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        subject: Wire,
+    ) -> Result<(), Error> {
+        let caller = sender(&header)?;
+        let (identified, _) = self.own_subject(connection, &caller, subject).await?;
+        let revoked = lock(&self.temporary).revoke_subject(&identified);
+        for kept in &revoked {
+            eprintln!(
+                "<6>temporary authorization {} for {} of user {} revoked by {caller}",
+                kept.id, kept.action_id, kept.uid
+            );
+        }
+        if !revoked.is_empty() {
+            Authority::changed(&emitter).await?;
+        }
+        Ok(())
+    }
+
+    async fn revoke_temporary_authorization_by_id(
+        &self,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] connection: &Connection,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        id: String,
+    ) -> Result<(), Error> {
+        let caller = sender(&header)?;
+        let caller_uid = self.caller_uid(connection, &caller).await?;
+        // The same answer whether it does not exist or is another user's.
+        let revoked = lock(&self.temporary).revoke_id(&id, caller_uid);
+        let Some(kept) = revoked else {
+            return Err(Error::Failed(format!(
+                "no temporary authorization {id:?} of this user"
+            )));
+        };
+        eprintln!(
+            "<6>temporary authorization {} for {} of user {} revoked by {caller}",
+            kept.id, kept.action_id, kept.uid
+        );
+        Authority::changed(&emitter).await?;
+        Ok(())
+    }
+}
+
+/// The unique name of the caller.
+fn sender(header: &Header<'_>) -> Result<String, Error> {
+    header
+        .sender()
+        .map(|sender| sender.to_string())
+        .ok_or_else(|| Error::Failed("no sender".to_string()))
 }
 
 #[cfg(test)]
@@ -648,7 +1193,7 @@ mod tests {
     #[test]
     fn only_the_caller_cancels_its_check() {
         let mut checks = ChecksInFlight::default();
-        let cancelled = checks.begin(":1.1", "a").unwrap().unwrap();
+        let cancelled = checks.begin(":1.1", "a").unwrap().by_id.unwrap();
         assert!(!checks.cancel(":1.2", "a"));
         assert!(!checks.cancel(":1.1", "b"));
         assert!(cancelled.try_recv().is_err());
@@ -657,6 +1202,26 @@ mod tests {
         checks.end(":1.1", "a");
         assert!(!checks.cancel(":1.1", "a"));
         assert!(checks.by_caller.is_empty());
+    }
+
+    #[test]
+    fn a_caller_leaving_ends_all_its_checks_and_only_its() {
+        let mut checks = ChecksInFlight::default();
+        let with_id = checks.begin(":1.1", "a").unwrap();
+        let without_id = checks.begin(":1.1", "").unwrap();
+        let other_caller = checks.begin(":1.2", "").unwrap();
+        checks.caller_left(":1.1");
+        // Both end at once; without the departure, wait() would never return.
+        futures_lite::future::block_on(with_id.wait());
+        futures_lite::future::block_on(without_id.wait());
+        assert_eq!(
+            other_caller.caller_left.try_recv(),
+            Err(async_channel::TryRecvError::Empty)
+        );
+        // The checks then end as usual, with nothing left to count.
+        checks.end(":1.1", "a");
+        checks.end(":1.1", "");
+        assert_eq!(checks.by_caller.len(), 1);
     }
 
     #[test]

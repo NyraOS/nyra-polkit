@@ -48,9 +48,10 @@ identity is `(sa{sv})`: a kind and its details.
 | `CheckAuthorization` | subject, `s` action, `a{ss}` details, `u` flags, `s` cancellation id → `(bba{ss})` | anyone, for a subject of its own user; for another user's subject only root or a user named in the action's `org.freedesktop.policykit.owner` annotation |
 | `CancelCheckAuthorization` | `s` cancellation id | the connection that started the check |
 | `EnumerateActions` | `s` locale → `a(ssssssuuua{ss})` | anyone |
-| `RegisterAuthenticationAgent` | subject, `s` locale, `o` path | the user the subject (a session of that user, or a process of that user) belongs to |
+| `RegisterAuthenticationAgent` | subject, `s` locale, `s` object path | the user the subject (a session, a process or a bus name of that user) belongs to |
 | `RegisterAuthenticationAgentWithOptions` | the same, `a{sv}` options (`fallback`: `b`) | the same |
-| `UnregisterAuthenticationAgent` | subject, `o` path | the connection that registered it |
+| `UnregisterAuthenticationAgent` | subject, `s` object path | the connection that registered it |
+| `AuthenticationAgentResponse` | `s` cookie, identity | nobody: `NotSupported` |
 | `AuthenticationAgentResponse2` | `u` uid, `s` cookie, identity | root only (the helper) |
 | `EnumerateTemporaryAuthorizations` | subject → `a(ss(sa{sv})tt)` | the subject's user, or root |
 | `RevokeTemporaryAuthorizations` | subject | the subject's user, or root |
@@ -61,18 +62,24 @@ what it says. A subject that cannot be identified is refused with a generic `Not
 ("cannot identify the subject"); the reason goes only to the journal, since it may name other
 users' processes and uids, which `/proc` mounted with `hidepid` would hide.
 
+The object path of an agent is an `s`, not an `o`: the reference manual gives it as a string, and
+Debian's polkitd introspects it as `s`.
+
 Properties: `BackendName` = `nyra-polkit`, `BackendVersion`, `BackendFeatures` = 1 (temporary
-authorizations; 0 until authentication agents are served, since no temporary authorization can be
-obtained before). `CheckAuthorization` returns one struct, `(bba{ss})`, not three values: polkit's
+authorizations). `CheckAuthorization` returns one struct, `(bba{ss})`, not three values: polkit's
 client library expects the struct. The `Changed` signal is sent after the rules are reread and when
-a temporary authorization appears, expires or is revoked. Errors use the documented names
+a temporary authorization appears or is revoked (see "Temporary authorizations" for expiry). Errors
+use the documented names
 (`org.freedesktop.PolicyKit1.Error.Failed`, `Cancelled`, `NotSupported`, `NotAuthorized`,
 `CancellationIdNotUnique`).
 
 `CheckAuthorization` flags: only `AllowUserInteraction` (1). Details whose names start with `polkit.`
 are refused unless documented (`polkit.message`, `polkit.gettext_domain`, `polkit.icon_name`), and
-those only from root. Result details: `polkit.temporary_authorization_id`,
-`polkit.retains_authorization_after_challenge`, `polkit.dismissed`.
+those only from root; `polkit.message` and `polkit.icon_name` replace the action's text and icon in
+the dialog. Result details: `polkit.temporary_authorization_id` (authorized by a temporary
+authorization, or one was just created), `polkit.retains_authorization_after_challenge` (a `_keep`
+result, a challenge or just authenticated), `polkit.dismissed`; their values are `true`, as Debian's
+polkitd sends (the manual only asks for a non-empty string).
 
 `ImplicitAuthorization` on the wire: 0 `no`, 1 `auth_self`, 2 `auth_admin`, 3 `auth_self_keep`,
 4 `auth_admin_keep`, 5 `yes`.
@@ -255,21 +262,27 @@ result = "no"
 
 When the decision is `auth_*` and the caller passed `AllowUserInteraction`:
 
-1. **Agent.** The agent registered for the subject's process, else for its session, else a
-   `fallback` agent. **Every agent, fallback agents included, only gets requests whose subject
-   belongs to the agent's user.** An agent is registered by the user of the session it serves (one
-   per session, plus fallbacks), or for a process of the registering user; it is removed by
-   `UnregisterAuthenticationAgent` from the connection that registered it, or when that connection
-   leaves the bus. No agent, or no
+1. **Agent.** An agent is registered for a subject of the registering user: a session (desktop
+   agents), a process or a bus name (`pkttyagent --process`, `--system-bus-name`); not even root
+   registers one for another user. Each subject has at most one agent besides `fallback` ones, and
+   a user at most 16 agents. An agent is removed by `UnregisterAuthenticationAgent` from the
+   connection that registered it (same subject and path), or when that connection leaves the bus.
+   A request goes to the agent registered for the subject itself (its bus name, or its process),
+   else for its session; fallback agents only when no other agent serves the subject (as the
+   manual describes `fallback`); among equals, the first registered. **Every agent, fallback agents
+   included, only gets requests whose subject belongs to the agent's user.** No agent, or no
    `AllowUserInteraction`: the result is "not authorized, challenge" (`is_challenge`), which
    pkcheck reports as exit code 2.
 2. **Identities offered.** `auth_self`: the subject's user. `auth_admin`: the subject's user if
    they are an administrator, else every administrator user (the listed users and the members of
-   the listed groups).
+   the listed groups, from the group's member list in the user database: users whose primary group
+   it is are not listed there, as with `usermod -aG sudo`). No identity at all: not authorized.
 3. **Cookie.** 128 random bits from getrandom(2), used once, tied to the request, the agent and the
    agent's user.
 4. **`BeginAuthentication(action_id, message, icon_name, details, cookie, identities)`** goes to the
-   agent, in the locale it registered with. The agent runs `polkit-agent-helper-1` (setuid, or the
+   agent, the message in the locale it registered with, the caller's details as they came, the
+   identities as `unix-user` with a `u` `uid`. The call has no timeout: typing a password takes
+   as long as it takes. The agent runs `polkit-agent-helper-1` (setuid, or the
    socket-activated service of recent polkit versions), which checks the password with PAM and, as
    root, calls **`AuthenticationAgentResponse2(uid, cookie, identity)`**.
 5. **The daemon accepts that answer only when** the caller is root (from the bus), the cookie is
@@ -280,8 +293,10 @@ When the decision is `auth_*` and the caller passed `AllowUserInteraction`:
    dialog): not authorized, with `polkit.dismissed`. Anything else: not authorized.
 
 `CancelCheckAuthorization`, or the caller leaving the bus, sends `CancelAuthentication(cookie)` to
-the agent and ends the check with `Cancelled`. An agent handles one authentication at a time;
-later requests wait in order.
+the agent and ends the check with `Cancelled`; the cookie is forgotten with the check. The caller
+leaving ends all its checks, interactive or not. An agent handles one authentication at a time;
+later requests wait their turn. The daemon's bus policy lets its user call agents
+(`org.freedesktop.PolicyKit1.AuthenticationAgent`), which are ordinary connections of the users.
 
 ## Temporary authorizations
 
@@ -298,12 +313,21 @@ asks for no more than its level: an `auth_admin_keep` authorization answers `aut
 (the decision can change when the session goes inactive). Any other decision (`no`, `auth_admin`)
 wins at once.
 
-It ends early when the subject leaves (bus name gone, process exited), when the session ends, on
-`RevokeTemporaryAuthorizations` / `RevokeTemporaryAuthorizationById` (`pkcheck --revoke-temp`),
-when the rules are reread (all of them), or when the daemon restarts (they are kept in memory
-only). Details are not compared: the same action
+It ends early when its bus name leaves the bus, on `RevokeTemporaryAuthorizations` /
+`RevokeTemporaryAuthorizationById` (`pkcheck --revoke-temp`), when the rules are reread (all of
+them), or when the daemon restarts (they are kept in memory only). One for a process that exited, or
+for a session that ended, can no longer be used, since a new process or session never has the same
+start time or id; it stays in the list until it expires. Expiry is checked whenever the list is
+used, on the boot clock, so an expired authorization is never used or listed; no timer runs for it,
+so no `Changed` is sent at that moment. Details are not compared: the same action
 and subject succeed even with other details, as polkit(8) says; rules that depend on details should
 not use the `_keep` results.
+
+`EnumerateTemporaryAuthorizations` and `RevokeTemporaryAuthorizations` take any subject: a session
+stands for every authorization of the subject's user in that session (`pkcheck --list-temp` and
+`--revoke-temp` name the caller's session), a process or a bus name for its own. A user other than
+root only names their own subjects and revokes their own authorizations by id; an id that does not
+exist and one of another user get the same error.
 
 ## Security
 
@@ -327,7 +351,7 @@ Threat model:
 | a remote user (SSH) | use their processes left in another user's local session (`su`, `sudo -u` at the seat) | a session of another user is not local, except for root |
 | a local user | write rules | rule files and directories must be root's and not writable by others |
 | a sandboxed app | act as more than its user | it is identified like any other client of the system bus, by the bus |
-| anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user other than root; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
+| anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user other than root, and 16 agents per user; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
 | a broken or hostile action file | crash or bloat the daemon | parse errors skip the file (its actions stay unknown, so denied); no external DTD or entity loading; node and size limits |
 | an administrator's typo | open more than meant | unknown keys are errors, and any error denies everything |
 
@@ -381,8 +405,9 @@ To the journal, with sd-daemon priority prefixes:
   most once a minute, with the number of checks denied since the last one, so the journal cannot
   be flooded.
 - **Agents:** each registration and removal (user, session or process, bus name, fallback or not).
-- **Authentications:** each attempt and its result (action, subject user and PID, identity
-  authenticated, authorized, dismissed or failed), and each `AuthenticationAgentResponse2` refused.
+- **Authentications:** each attempt and its result (action, subject user and PID, the agent, the
+  identities offered and the one authenticated, authorized, dismissed or failed), and each
+  `AuthenticationAgentResponse2` refused, with the reason.
 - **Temporary authorizations:** created, used, and revoked or expired.
 - **Action files:** files skipped and action ids dropped as defined twice.
 - **Refused subjects:** why a subject could not be identified (the caller only gets a generic
@@ -409,7 +434,9 @@ Cookies are never logged.
   `unix-session`) and our `pkcheck` (same exit codes: 0, 1, 2, 3, 126, 127), `libpolkit-gobject-1` through GObject
   introspection (`CheckAuthorization`, `EnumerateActions`, temporary authorizations, cancellation),
   and a test agent on `libpolkit-agent-1` with the real `polkit-agent-helper-1` and a test user in
-  the container. The bus traffic of these clients is recorded, which is how the subject details
+  the container. Until that agent is in place, the tests' own agent covers the protocol: the test
+  binary, run again as another user, registers as an agent and passes each dialog on to the test,
+  which answers `AuthenticationAgentResponse2` as root, like the helper. The bus traffic of these clients is recorded, which is how the subject details
   they send are confirmed. The same `pkcheck` matrix also runs against Debian's polkitd (default
   rules only), and the answers must match.
 - **In the Nyra OS image** (later, before it replaces polkitd there): the image's own test battery
@@ -419,8 +446,9 @@ Cookies are never logged.
 
 Few, and each justified in `Cargo.toml`: `roxmltree` (action XML), `serde` and `toml` (rules),
 `zbus` (the bus, with its own small async runtime, no tokio) and `nix` (user names and groups from
-NSS). `rustix` (pidfds), `async-signal` (SIGHUP), `async-channel` (cancellation), `blocking` (NSS
-and `/proc` reads off the executor) and `futures-lite` are used directly but come with zbus anyway;
+NSS). `rustix` (pidfds, getrandom(2), `CLOCK_BOOTTIME`), `async-signal` (SIGHUP), `async-channel`
+(cancellation), `async-lock` (one authentication at a time per agent), `blocking` (NSS and `/proc`
+reads off the executor) and `futures-lite` are used directly but come with zbus anyway;
 so does `async-io`, used by the tests for timeouts. `cargo deny` checks their licences and
 advisories on every pull request.
 
@@ -432,6 +460,8 @@ Read for this design; nothing from polkit's source code.
   <https://www.freedesktop.org/software/polkit/docs/latest/eggdbus-interface-org.freedesktop.PolicyKit1.Authority.html>
 - polkit Reference Manual, `org.freedesktop.PolicyKit1.AuthenticationAgent`:
   <https://www.freedesktop.org/software/polkit/docs/latest/eggdbus-interface-org.freedesktop.PolicyKit1.AuthenticationAgent.html>
+- pkttyagent(1) (`--process`, `--system-bus-name`, `--fallback`):
+  <https://www.freedesktop.org/software/polkit/docs/latest/pkttyagent.1.html>
 - polkit(8) (actions, defaults, annotations, administrators, `_keep`):
   <https://www.freedesktop.org/software/polkit/docs/latest/polkit.8.html>
 - pkcheck(1) (options, process forms, exit codes):
@@ -454,3 +484,11 @@ Read for this design; nothing from polkit's source code.
   and `Active=yes`; Debian 13's `pkcheck` (polkit 126) sends a `unix-process` subject with `pid`
   (`u`), `start-time` (`t`) and `uid` (`i`), no pidfd, and reads the result of `CheckAuthorization`
   as one `(bba{ss})` struct.
+- Observed on Debian 13 with its polkitd, `pkttyagent` and `polkit-agent-helper-1` (bus traffic,
+  introspection): the agent's object path is an `s`; `pkttyagent --process` registers a
+  `unix-process` subject; `BeginAuthentication` carries identities as `unix-user` with a `u` `uid`;
+  the helper calls `AuthenticationAgentResponse2` as root with the agent user's uid and waits for
+  its reply before the agent returns; a `_keep` success answers `polkit.temporary_authorization_id`
+  and `polkit.retains_authorization_after_challenge` = `true`, a later check without user
+  interaction is authorized by it, and `Changed` is sent when it is created;
+  `EnumerateTemporaryAuthorizations` there accepts only `unix-session` subjects.

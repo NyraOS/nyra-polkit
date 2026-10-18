@@ -23,12 +23,15 @@ toml = { version = "1", default-features = false, features = ["std", "parse", "s
 # version that builds with Rust 1.85 (deny.toml says why that matters).
 zbus = { version = "5.13.2", default-features = false, features = ["async-io"] }
 # The rest is already in zbus's dependency tree; used directly, they add no crate:
-# - pidfd_open(2) and poll(2) on a pidfd, safely (no unsafe code here);
-rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "event"] }
+# - pidfd_open(2) and poll(2) on a pidfd, getrandom(2) for the cookies and CLOCK_BOOTTIME for the
+#   temporary authorizations, safely (no unsafe code here);
+rustix = { version = "1.1.5", default-features = false, features = ["std", "process", "event", "rand", "time"] }
 # - SIGHUP (`systemctl reload`) as an async stream, in the same runtime as the bus;
 async-signal = "0.2.14"
 # - what CancelCheckAuthorization uses to stop a check in flight;
 async-channel = "2.5.0"
+# - an async mutex, so an agent runs one authentication at a time and the others wait their turn;
+async-lock = "3.4.2"
 # - block_on for main and racing a check against its cancellation.
 futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
 # - NSS lookups and /proc reads as blocking tasks, off the bus executor, so a slow user database

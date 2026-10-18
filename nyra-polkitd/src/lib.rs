@@ -5,15 +5,18 @@
 //! - [`rules`]: the TOML rules of the image and of the administrator;
 //! - [`decision`]: what a subject gets for an action, from the two above;
 //! - [`process`], [`logind`], [`subject`]: who asks, as the kernel, logind and the bus know it;
+//! - [`agents`], [`temporary`]: authentication agents, and what an authentication leaves behind;
 //! - [`authority`]: the D-Bus service, `org.freedesktop.PolicyKit1`.
 
 pub mod actions;
+pub mod agents;
 pub mod authority;
 pub mod decision;
 pub mod logind;
 pub mod process;
 pub mod rules;
 pub mod subject;
+pub mod temporary;
 
 use serde::Deserialize;
 use std::fs::File;

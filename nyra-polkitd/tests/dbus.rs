@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: MIT
 //! nyra-polkitd on a private, system-like bus (docs/DESIGN.md, "Tests"), with the bus policy from
 //! `dist/`. The daemon runs as the `polkitd` user, as the service does; logind is a fake served by
-//! the test on the same bus, so each process can be put in any session. Clients: zbus and Debian's
-//! `pkcheck`.
+//! the test on the same bus, so each process can be put in any session. Clients: zbus, Debian's
+//! `pkcheck` and `busctl`.
+//!
+//! Authentication agents are this test binary run again as another user ([`fake_agent_program`]):
+//! each registers with the daemon and passes every dialog on to the test (the "relay"), which plays
+//! the user and, as root, the helper that answers `AuthenticationAgentResponse2`.
 //!
 //! Needs root (to create rule files owned by root and to run processes as other users), a writable
 //! `/sys/fs/cgroup` (to put a process under a user's service manager), `dbus-daemon`, `pkcheck`,
-//! `busctl`, `setpriv` and the users `polkitd` and `nobody`: the integration job of CI runs them in
-//! a privileged Debian 13 container with `cargo test --test dbus -- --ignored`.
+//! `busctl`, `setpriv`, `timeout` and the users `polkitd`, `nobody` and `daemon`: the integration
+//! job of CI runs them in a privileged Debian 13 container with
+//! `cargo test --test dbus -- --ignored`.
 //!
 //! Every wait has a timeout, so a regression fails the test instead of hanging the job.
 
@@ -15,14 +20,15 @@ use futures_lite::StreamExt;
 use nyra_polkitd::process::Process;
 use std::collections::HashMap;
 use std::fs::{File, Permissions};
+use std::io::{BufRead, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use zbus::fdo::DBusProxy;
 use zbus::message::Type as MessageType;
-use zbus::zvariant::{OwnedObjectPath, Value};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream, interface};
 
 const NAME: &str = "org.freedesktop.PolicyKit1";
@@ -83,10 +89,45 @@ const ACTIONS: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
+  <action id="org.nyra.test.self">
+    <message>Authenticate yourself</message>
+    <message xml:lang="en_US">Authenticate yourself, in English</message>
+    <icon_name>test-icon</icon_name>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>auth_self</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+  <action id="org.nyra.test.self-keep">
+    <defaults>
+      <allow_any>auth_self_keep</allow_any>
+      <allow_inactive>auth_self_keep</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
+  <action id="org.nyra.test.admin">
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+  </action>
+  <!-- The user's own password in the foreground, an administrator's otherwise. -->
+  <action id="org.nyra.test.levels">
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_self_keep</allow_active>
+    </defaults>
+  </action>
 </policyconfig>
 "#;
 
 const RULES: &str = r#"
+[administrators]
+users = ["nobody", "bin"]
+
 [[rule]]
 actions = ["org.nyra.test.ruled"]
 users = ["root"]
@@ -112,8 +153,26 @@ const CHALLENGE: &str = "org.nyra.test.challenge";
 const UNKNOWN: &str = "org.nyra.test.unknown";
 const OWNED: &str = "org.nyra.test.owned";
 const OWNED_BARE: &str = "org.nyra.test.owned-bare";
+const SELF: &str = "org.nyra.test.self";
+const SELF_KEEP: &str = "org.nyra.test.self-keep";
+const ADMIN: &str = "org.nyra.test.admin";
+const LEVELS: &str = "org.nyra.test.levels";
+
+/// `AllowUserInteraction`.
+const ALLOW: u32 = 1;
+const NOBODY: u32 = 65534;
+const DAEMON: u32 = 1;
+const BIN: u32 = 2;
 
 type Answer = (bool, bool, HashMap<String, String>);
+/// id, action id, subject, obtained, expires.
+type TemporaryAuthorization = (
+    String,
+    String,
+    (String, HashMap<String, OwnedValue>),
+    u64,
+    u64,
+);
 const YES: (bool, bool) = (true, false);
 const NO: (bool, bool) = (false, false);
 const CHALLENGED: (bool, bool) = (false, true);
@@ -225,32 +284,36 @@ impl FakeManager {
     }
 }
 
-struct FakeSessionObject(FakeSession);
+struct FakeSessionObject(String, FakeSession);
 
 #[interface(name = "org.freedesktop.login1.Session")]
 impl FakeSessionObject {
     #[zbus(property)]
+    fn id(&self) -> String {
+        self.0.clone()
+    }
+    #[zbus(property)]
     fn remote(&self) -> bool {
-        self.0.remote
+        self.1.remote
     }
     #[zbus(property)]
     fn seat(&self) -> (String, OwnedObjectPath) {
-        let path = match self.0.seat {
+        let path = match self.1.seat {
             "" => "/",
             _ => "/org/freedesktop/login1/seat/seat0",
         };
         (
-            self.0.seat.to_string(),
+            self.1.seat.to_string(),
             OwnedObjectPath::try_from(path).unwrap(),
         )
     }
     #[zbus(property)]
     fn active(&self) -> bool {
-        self.0.active
+        self.1.active
     }
     #[zbus(property)]
     fn user(&self) -> (u32, OwnedObjectPath) {
-        (self.0.uid, user_path(self.0.uid))
+        (self.1.uid, user_path(self.1.uid))
     }
 }
 
@@ -373,9 +436,11 @@ impl Harness {
   <policy user="root">
     <allow send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus.Monitoring"/>
     <allow own="org.freedesktop.login1"/>
+    <allow own="org.nyra.test.Relay"/>
   </policy>
   <policy context="default">
     <allow send_destination="org.freedesktop.login1"/>
+    <allow send_destination="org.nyra.test.Relay"/>
   </policy>
   <include>{policy}</include>
 </busconfig>
@@ -460,7 +525,7 @@ impl Harness {
     async fn add_session(&self, id: &str, session: FakeSession) {
         self.logind
             .object_server()
-            .at(session_path(id), FakeSessionObject(session))
+            .at(session_path(id), FakeSessionObject(id.to_string(), session))
             .await
             .unwrap();
         let mut state = self.logind_state.lock().unwrap();
@@ -536,8 +601,26 @@ impl Harness {
             .map(|(authorized, challenge, _)| (authorized, challenge))
     }
 
+    /// The same session, in another state (the user switched away, or back).
+    async fn change_session(&self, id: &str, session: FakeSession) {
+        self.logind
+            .object_server()
+            .remove::<FakeSessionObject, _>(session_path(id))
+            .await
+            .unwrap();
+        self.add_session(id, session).await;
+    }
+
     /// Runs a client on the test bus, as `user` (a name or a uid) or as root.
     fn run(&self, user: Option<&str>, program: &str, arguments: &[&str]) -> Output {
+        self.command(user, program, arguments)
+            .output()
+            .expect("setpriv")
+    }
+
+    /// A client on the test bus, as `user` or as root, given [`TIMEOUT`] by `timeout`: a client
+    /// that hangs fails the test (`timeout` exits with 124).
+    fn command(&self, user: Option<&str>, program: &str, arguments: &[&str]) -> Command {
         let mut command = Command::new("setpriv");
         match user {
             Some(user) => command.args([
@@ -550,15 +633,12 @@ impl Harness {
             ]),
             None => command.arg("--reuid=0"),
         };
-        // pkcheck and busctl give up after 25 s by themselves.
         command
-            .arg("--")
-            .arg(program)
+            .args(["--", "timeout", &TIMEOUT.as_secs().to_string(), program])
             .args(arguments)
             .env("DBUS_SYSTEM_BUS_ADDRESS", &self.address)
-            .stdin(Stdio::null())
-            .output()
-            .expect("setpriv")
+            .stdin(Stdio::null());
+        command
     }
 
     /// Runs pkcheck as `user` or as root: see [`pkcheck_answer`].
@@ -1236,8 +1316,14 @@ fn actions_properties_and_cancellation() {
             .unwrap();
         let actions: Vec<Description> = reply.body().deserialize().unwrap();
         let ids: Vec<&str> = actions.iter().map(|action| action.0.as_str()).collect();
-        assert_eq!(ids, [CHALLENGE, DEFAULT, DENIED, OWNED, OWNED_BARE, RULED]);
-        let default = &actions[1];
+        assert_eq!(
+            ids,
+            [
+                ADMIN, CHALLENGE, DEFAULT, DENIED, LEVELS, OWNED, OWNED_BARE, RULED, SELF,
+                SELF_KEEP
+            ]
+        );
+        let default = &actions[2];
         assert_eq!(default.1, "Fă lucrul implicit");
         assert_eq!(default.2, "Authentication is required");
         assert_eq!(default.3, "nyra-polkit tests");
@@ -1257,7 +1343,8 @@ fn actions_properties_and_cancellation() {
             .await
             .unwrap();
         assert_eq!(&*all["BackendName"], &Value::from("nyra-polkit"));
-        assert_eq!(&*all["BackendFeatures"], &Value::U32(0));
+        // Temporary authorizations.
+        assert_eq!(&*all["BackendFeatures"], &Value::U32(1));
         assert_eq!(
             &*all["BackendVersion"],
             &Value::from(env!("CARGO_PKG_VERSION"))
@@ -1510,5 +1597,895 @@ fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
 
         drop(bus);
         drop(cgroup);
+    });
+}
+
+// --- Authentication agents ---------------------------------------------------------------------
+
+const AGENT_PATH: &str = "/org/nyra/test/Agent";
+const RELAY_NAME: &str = "org.nyra.test.Relay";
+const RELAY_PATH: &str = "/org/nyra/test/Relay";
+const RELAY_INTERFACE: &str = "org.nyra.test.Relay";
+/// Set in the environment of this test binary when it runs as a fake agent.
+const FAKE_AGENT: &str = "NYRA_POLKIT_FAKE_AGENT";
+
+/// What agents answer, and what the relay tells the fake agent to answer.
+#[derive(Debug, zbus::DBusError)]
+#[zbus(prefix = "org.freedesktop.PolicyKit1.Error")]
+enum AgentError {
+    #[zbus(error)]
+    ZBus(zbus::Error),
+    Cancelled(String),
+    Failed(String),
+}
+
+/// The agent a fake agent process serves: it passes each call on to the relay in the test, and
+/// answers what the relay answers.
+struct FakeAgent {
+    label: String,
+}
+
+#[interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
+impl FakeAgent {
+    #[allow(clippy::too_many_arguments)] // The method's D-Bus arguments, plus the connection.
+    async fn begin_authentication(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        action_id: String,
+        message: String,
+        icon_name: String,
+        details: HashMap<String, String>,
+        cookie: String,
+        identities: Vec<(String, HashMap<String, OwnedValue>)>,
+    ) -> Result<(), AgentError> {
+        // Identities as polkit's agents read them: unix-user, with the uid a u32.
+        let mut uids = Vec::new();
+        for (kind, identity) in &identities {
+            match (kind.as_str(), identity.get("uid").map(|uid| &**uid)) {
+                ("unix-user", Some(Value::U32(uid))) => uids.push(*uid),
+                _ => return Err(AgentError::Failed(format!("identity {kind} {identity:?}"))),
+            }
+        }
+        let relayed = connection
+            .call_method(
+                Some(RELAY_NAME),
+                RELAY_PATH,
+                Some(RELAY_INTERFACE),
+                "BeginAuthentication",
+                &(
+                    &self.label,
+                    action_id,
+                    message,
+                    icon_name,
+                    details,
+                    cookie,
+                    uids,
+                ),
+            )
+            .await;
+        match relayed {
+            Ok(_) => Ok(()),
+            Err(zbus::Error::MethodError(name, _, _)) if name.as_str() == CANCELLED => {
+                Err(AgentError::Cancelled("dismissed".to_string()))
+            }
+            Err(error) => Err(AgentError::Failed(error.to_string())),
+        }
+    }
+
+    async fn cancel_authentication(
+        &self,
+        #[zbus(connection)] connection: &Connection,
+        cookie: String,
+    ) -> Result<(), AgentError> {
+        connection
+            .call_method(
+                Some(RELAY_NAME),
+                RELAY_PATH,
+                Some(RELAY_INTERFACE),
+                "CancelAuthentication",
+                &(&self.label, cookie),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+/// Not a test: this binary, run again as another user, is the fake agent (see the top). It
+/// registers, says `agent: registered <its bus name>` or `agent: failed <error>` on stdout, then
+/// obeys `unregister` on stdin until stdin closes.
+#[test]
+#[ignore = "the fake agent: the tests run it as another user"]
+fn fake_agent_program() {
+    let Ok(spec) = std::env::var(FAKE_AGENT) else {
+        return;
+    };
+    futures_lite::future::block_on(run_fake_agent(&spec));
+}
+
+/// `spec`: `<label>|session|<session id>|<fallback: 0 or 1>` or `<label>|process|<pid>|<fallback>`.
+async fn run_fake_agent(spec: &str) {
+    let [label, kind, subject, fallback] = spec.split('|').collect::<Vec<_>>()[..] else {
+        panic!("fake agent: {spec:?}");
+    };
+    let say = |line: &str| {
+        println!("agent: {line}");
+        std::io::stdout().flush().unwrap();
+    };
+    let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").unwrap();
+    let agent = FakeAgent {
+        label: label.to_string(),
+    };
+    let connection = zbus::connection::Builder::address(address.as_str())
+        .unwrap()
+        .serve_at(AGENT_PATH, agent)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    let subject = match kind {
+        "session" => unix_session(subject),
+        "process" => unix_process(subject.parse().unwrap()),
+        _ => panic!("fake agent: {spec:?}"),
+    };
+    let options = HashMap::from([("fallback", Value::Bool(fallback == "1"))]);
+    let registered = connection
+        .call_method(
+            Some(NAME),
+            PATH,
+            Some(INTERFACE),
+            "RegisterAuthenticationAgentWithOptions",
+            &(&subject, "en_US.UTF-8", AGENT_PATH, options),
+        )
+        .await;
+    match registered {
+        Ok(_) => say(&format!("registered {}", connection.unique_name().unwrap())),
+        Err(error) => return say(&format!("failed {}", error_name(error))),
+    }
+    let (sender, lines) = async_channel::unbounded();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lines() {
+            if sender.send_blocking(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    while let Ok(line) = lines.recv().await {
+        assert_eq!(line, "unregister", "fake agent: unknown command");
+        let unregistered = connection
+            .call_method(
+                Some(NAME),
+                PATH,
+                Some(INTERFACE),
+                "UnregisterAuthenticationAgent",
+                &(&subject, AGENT_PATH),
+            )
+            .await;
+        match unregistered {
+            Ok(_) => say("unregistered"),
+            Err(error) => say(&format!("failed {}", error_name(error))),
+        }
+    }
+}
+
+/// A fake agent process; killed when dropped, which takes its connection off the bus.
+struct AgentProcess {
+    child: Child,
+    stdin: ChildStdin,
+    lines: std::sync::mpsc::Receiver<String>,
+}
+
+impl AgentProcess {
+    /// The next line the agent says, without its `agent: ` prefix.
+    fn says(&self) -> String {
+        self.lines
+            .recv_timeout(TIMEOUT)
+            .expect("timed out waiting for the fake agent")
+    }
+
+    fn unregister(&mut self) -> String {
+        writeln!(self.stdin, "unregister").unwrap();
+        self.says()
+    }
+}
+
+impl Drop for AgentProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A dialog an agent was asked to show, passed on to the test.
+struct Dialog {
+    agent: String,
+    action_id: String,
+    message: String,
+    icon_name: String,
+    details: HashMap<String, String>,
+    cookie: String,
+    identities: Vec<u32>,
+    answer: async_channel::Sender<bool>,
+}
+
+impl Dialog {
+    /// The agent returns from `BeginAuthentication`, as after the helper's answer.
+    async fn agent_returns(self) {
+        self.answer.send(true).await.unwrap();
+    }
+
+    /// The user closed the dialog: the agent answers `Cancelled`.
+    async fn dismiss(self) {
+        self.answer.send(false).await.unwrap();
+    }
+}
+
+struct Relay {
+    dialogs: async_channel::Sender<Dialog>,
+    cancels: async_channel::Sender<(String, String)>,
+}
+
+#[interface(name = "org.nyra.test.Relay")]
+impl Relay {
+    #[allow(clippy::too_many_arguments)] // The fake agent's arguments.
+    async fn begin_authentication(
+        &self,
+        agent: String,
+        action_id: String,
+        message: String,
+        icon_name: String,
+        details: HashMap<String, String>,
+        cookie: String,
+        identities: Vec<u32>,
+    ) -> Result<(), AgentError> {
+        let (answer, answered) = async_channel::bounded(1);
+        let dialog = Dialog {
+            agent,
+            action_id,
+            message,
+            icon_name,
+            details,
+            cookie,
+            identities,
+            answer,
+        };
+        let _ = self.dialogs.send(dialog).await;
+        match answered.recv().await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(AgentError::Cancelled("dismissed".to_string())),
+            Err(_) => Err(AgentError::Failed("the test did not answer".to_string())),
+        }
+    }
+
+    async fn cancel_authentication(&self, agent: String, cookie: String) {
+        let _ = self.cancels.send((agent, cookie)).await;
+    }
+}
+
+/// What the agents passed on to the test.
+struct Dialogs {
+    _relay: Connection,
+    dialogs: async_channel::Receiver<Dialog>,
+    cancels: async_channel::Receiver<(String, String)>,
+}
+
+impl Dialogs {
+    async fn next(&self) -> Dialog {
+        within("a dialog", self.dialogs.recv()).await.unwrap()
+    }
+
+    /// The next `CancelAuthentication`: the agent and the cookie.
+    async fn cancelled(&self) -> (String, String) {
+        within("CancelAuthentication", self.cancels.recv())
+            .await
+            .unwrap()
+    }
+
+    fn none_pending(&self) -> bool {
+        self.dialogs.is_empty() && self.cancels.is_empty()
+    }
+}
+
+impl Harness {
+    async fn relay(&self) -> Dialogs {
+        let (dialogs, dialogs_received) = async_channel::unbounded();
+        let (cancels, cancels_received) = async_channel::unbounded();
+        let relay = zbus::connection::Builder::address(self.address.as_str())
+            .unwrap()
+            .serve_at(RELAY_PATH, Relay { dialogs, cancels })
+            .unwrap()
+            .name(RELAY_NAME)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        Dialogs {
+            _relay: relay,
+            dialogs: dialogs_received,
+            cancels: cancels_received,
+        }
+    }
+
+    /// Starts a fake agent as `user` (see [`run_fake_agent`] for `spec`); its bus name, or the
+    /// error its registration got.
+    fn agent(&self, user: &str, spec: &str) -> Result<(AgentProcess, String), String> {
+        let mut child = Command::new("setpriv")
+            .args([
+                &format!("--reuid={user}"),
+                "--regid=nogroup",
+                "--clear-groups",
+                "--",
+            ])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "fake_agent_program", "--ignored", "--nocapture"])
+            .args(["--quiet", "--test-threads=1"])
+            .env(FAKE_AGENT, spec)
+            .env("DBUS_SYSTEM_BUS_ADDRESS", &self.address)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("the fake agent");
+        let stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in stdout.lines().map_while(Result::ok) {
+                if let Some(said) = line.strip_prefix("agent: ") {
+                    let _ = sender.send(said.to_string());
+                }
+            }
+        });
+        let agent = AgentProcess {
+            stdin: child.stdin.take().unwrap(),
+            child,
+            lines,
+        };
+        let first = agent.says();
+        match first.strip_prefix("registered ") {
+            Some(name) => Ok((agent, name.to_string())),
+            None => Err(first.strip_prefix("failed ").unwrap_or(&first).to_string()),
+        }
+    }
+
+    /// `AuthenticationAgentResponse2` from root, as polkit-agent-helper-1 sends it.
+    async fn respond(&self, uid: u32, cookie: &str, identity: u32) -> Result<(), String> {
+        let identity = ("unix-user", HashMap::from([("uid", Value::U32(identity))]));
+        self.client
+            .call_method(
+                Some(NAME),
+                PATH,
+                Some(INTERFACE),
+                "AuthenticationAgentResponse2",
+                &(uid, cookie, identity),
+            )
+            .await
+            .map(|_| ())
+            .map_err(error_name)
+    }
+
+    /// busctl as `user` calling a method of the authority: its exit code and what it printed.
+    fn busctl_as(&self, user: &str, method: &str, arguments: &[&str]) -> (Option<i32>, String) {
+        let output = self.run(
+            Some(user),
+            "busctl",
+            &[&["call", NAME, PATH, INTERFACE, method], arguments].concat(),
+        );
+        let printed = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+        (output.status.code(), printed)
+    }
+
+    /// An interactive check whose dialog the user and the helper complete: the answer.
+    async fn authenticate(
+        &self,
+        dialogs: &Dialogs,
+        subject: &Subject,
+        action: &str,
+    ) -> Result<Answer, String> {
+        let checking = self.check_with(subject, action, HashMap::new(), ALLOW, "");
+        let helping = async {
+            let dialog = dialogs.next().await;
+            // Here the identity offered is the agent's own user.
+            let agent_uid = dialog.identities[0];
+            assert_eq!(
+                self.respond(agent_uid, &dialog.cookie, dialog.identities[0])
+                    .await,
+                Ok(())
+            );
+            dialog.agent_returns().await;
+        };
+        futures_lite::future::zip(checking, helping).await.0
+    }
+
+    /// The agent that gets the dialog of an interactive check of `subject` (dismissed).
+    async fn agent_for(&self, dialogs: &Dialogs, subject: &Subject) -> String {
+        let checking = self.check_with(subject, SELF, HashMap::new(), ALLOW, "");
+        let dismissing = async {
+            let dialog = dialogs.next().await;
+            let agent = dialog.agent.clone();
+            dialog.dismiss().await;
+            agent
+        };
+        futures_lite::future::zip(checking, dismissing).await.1
+    }
+
+    /// Waits until the daemon has logged `text`.
+    fn logged(&self, text: &str) {
+        wait_until(text, || self.log().contains(text));
+    }
+}
+
+/// Sends a check without waiting for its answer.
+async fn send_interactive_check(connection: &Connection, subject: &Subject, action: &str) {
+    let message = zbus::Message::method_call(PATH, "CheckAuthorization")
+        .unwrap()
+        .destination(NAME)
+        .unwrap()
+        .interface(INTERFACE)
+        .unwrap()
+        .build(&(subject, action, HashMap::<&str, &str>::new(), ALLOW, ""))
+        .unwrap();
+    connection.send(&message).await.unwrap();
+}
+
+const NOBODY_ACTIVE: FakeSession = FakeSession {
+    uid: NOBODY,
+    ..LOCAL_ACTIVE
+};
+
+const UNKNOWN_COOKIE: &str = "0123456789abcdef0123456789abcdef";
+
+fn no_details() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn an_agent_authenticates_only_with_the_helpers_answer() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("agent", "").await;
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let dialogs = bus.relay().await;
+        let (_agent, _) = bus.agent("nobody", "nobody|session|c2|0").unwrap();
+        let app = Sleeper::start(Some("nobody"));
+        bus.place(app.pid(), ByPid::Session("c2"));
+        let subject = unix_process(app.pid());
+
+        // Without AllowUserInteraction, still a challenge.
+        assert_eq!(bus.check(&subject, SELF).await, Ok(CHALLENGED));
+        assert!(dialogs.none_pending());
+
+        let details = HashMap::from([("color", "blue")]);
+        let checking = bus.check_with(&subject, SELF, details, ALLOW, "");
+        let helping = async {
+            let dialog = dialogs.next().await;
+            // The action's text in the agent's locale, its icon, the caller's details, and the
+            // subject's own user to authenticate as.
+            assert_eq!(dialog.agent, "nobody");
+            assert_eq!(dialog.action_id, SELF);
+            assert_eq!(dialog.message, "Authenticate yourself, in English");
+            assert_eq!(dialog.icon_name, "test-icon");
+            assert_eq!(dialog.details["color"], "blue");
+            assert_eq!(dialog.identities, [NOBODY]);
+            // 128 random bits.
+            assert_eq!(dialog.cookie.len(), 32, "{}", dialog.cookie);
+
+            // Refused: from a user other than root, an unknown cookie, a uid that is not the
+            // agent's user, an identity not offered.
+            let uid = NOBODY.to_string();
+            let (code, printed) = bus.busctl_as(
+                "nobody",
+                "AuthenticationAgentResponse2",
+                &[
+                    "us(sa{sv})",
+                    &uid,
+                    &dialog.cookie,
+                    "unix-user",
+                    "1",
+                    "uid",
+                    "u",
+                    &uid,
+                ],
+            );
+            assert_eq!(code, Some(1), "{printed}");
+            assert!(printed.contains("only root may answer"), "{printed}");
+            let refused = Err(FAILED.to_string());
+            assert_eq!(bus.respond(NOBODY, UNKNOWN_COOKIE, NOBODY).await, refused);
+            assert_eq!(bus.respond(0, &dialog.cookie, NOBODY).await, refused);
+            assert_eq!(bus.respond(NOBODY, &dialog.cookie, 0).await, refused);
+            // The old answer, without the uid, is not supported at all.
+            let identity = ("unix-user", HashMap::from([("uid", Value::U32(NOBODY))]));
+            let old = bus
+                .client
+                .call_method(
+                    Some(NAME),
+                    PATH,
+                    Some(INTERFACE),
+                    "AuthenticationAgentResponse",
+                    &(&dialog.cookie, identity),
+                )
+                .await
+                .map(|_| ())
+                .map_err(error_name);
+            assert_eq!(
+                old,
+                Err("org.freedesktop.PolicyKit1.Error.NotSupported".to_string())
+            );
+            // Accepted once.
+            assert_eq!(bus.respond(NOBODY, &dialog.cookie, NOBODY).await, Ok(()));
+            assert_eq!(bus.respond(NOBODY, &dialog.cookie, NOBODY).await, refused);
+            dialog.agent_returns().await;
+        };
+        let (answer, ()) = futures_lite::future::zip(checking, helping).await;
+        assert_eq!(answer, Ok((true, false, no_details())));
+        let log = bus.log();
+        assert!(log.contains("refused: the caller is not root"), "{log}");
+        assert!(
+            log.contains("refused: the identity was not offered"),
+            "{log}"
+        );
+
+        // The agent returns without the helper's answer: not authorized.
+        let checking = bus.check_with(&subject, SELF, HashMap::new(), ALLOW, "");
+        let helping = async { dialogs.next().await.agent_returns().await };
+        let (answer, ()) = futures_lite::future::zip(checking, helping).await;
+        assert_eq!(answer, Ok((false, false, no_details())));
+
+        // Dismissed, even after the helper answered: not authorized, and said so.
+        let checking = bus.check_with(&subject, SELF, HashMap::new(), ALLOW, "");
+        let helping = async {
+            let dialog = dialogs.next().await;
+            assert_eq!(bus.respond(NOBODY, &dialog.cookie, NOBODY).await, Ok(()));
+            dialog.dismiss().await;
+        };
+        let (answer, ()) = futures_lite::future::zip(checking, helping).await;
+        let dismissed = HashMap::from([("polkit.dismissed".to_string(), "true".to_string())]);
+        assert_eq!(answer, Ok((false, false, dismissed)));
+
+        // Cookies are never logged.
+        let log = bus.log();
+        assert!(!log.contains(UNKNOWN_COOKIE), "{log}");
+
+        // pkcheck --allow-user-interaction, end to end.
+        let pid = app.pid().to_string();
+        let mut pkcheck = bus.command(
+            None,
+            "pkcheck",
+            &[
+                "--action-id",
+                SELF,
+                "--process",
+                &pid,
+                "--allow-user-interaction",
+            ],
+        );
+        let pkcheck = blocking::unblock(move || pkcheck.output());
+        let helping = async {
+            let dialog = dialogs.next().await;
+            assert_eq!(bus.respond(NOBODY, &dialog.cookie, NOBODY).await, Ok(()));
+            dialog.agent_returns().await;
+        };
+        let (output, ()) = futures_lite::future::zip(pkcheck, helping).await;
+        assert_eq!(pkcheck_answer(output.unwrap()), Ok(PKCHECK_AUTHORIZED));
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn cancelling_or_leaving_closes_the_dialog() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("agent-cancel", "").await;
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let dialogs = bus.relay().await;
+        let (_agent, _) = bus.agent("nobody", "nobody|session|c2|0").unwrap();
+        let app = Sleeper::start(Some("nobody"));
+        bus.place(app.pid(), ByPid::Session("c2"));
+        let subject = unix_process(app.pid());
+
+        // CancelCheckAuthorization while the dialog is up: the check is cancelled, the agent told
+        // to close the dialog, and its cookie no longer answers.
+        let checking = bus.check_with(&subject, SELF, HashMap::new(), ALLOW, "c");
+        let cancelling = async {
+            let dialog = dialogs.next().await;
+            assert_eq!(bus.cancel("c").await, Ok(()));
+            assert_eq!(
+                dialogs.cancelled().await,
+                ("nobody".to_string(), dialog.cookie.clone())
+            );
+            assert_eq!(
+                bus.respond(NOBODY, &dialog.cookie, NOBODY).await,
+                Err(FAILED.to_string())
+            );
+            dialog.dismiss().await;
+        };
+        let (cancelled, ()) = futures_lite::future::zip(checking, cancelling).await;
+        assert_eq!(cancelled.map(|_| ()), Err(CANCELLED.to_string()));
+
+        // The caller leaves the bus while the dialog is up: the same.
+        let leaving = connect(&bus.address).await;
+        send_interactive_check(&leaving, &subject, SELF).await;
+        let dialog = dialogs.next().await;
+        leaving.close().await.unwrap();
+        assert_eq!(
+            dialogs.cancelled().await,
+            ("nobody".to_string(), dialog.cookie.clone())
+        );
+        dialog.dismiss().await;
+
+        // The agent is free for the next one.
+        assert_eq!(
+            bus.authenticate(&dialogs, &subject, SELF).await,
+            Ok((true, false, no_details()))
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn agents_only_get_requests_of_their_own_user() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("agent-users", "").await;
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let daemon_session = FakeSession {
+            uid: DAEMON,
+            ..LOCAL_ACTIVE
+        };
+        bus.add_session("c4", daemon_session).await;
+        let dialogs = bus.relay().await;
+        let nobody_app = Sleeper::start(Some("nobody"));
+        bus.place(nobody_app.pid(), ByPid::Session("c2"));
+
+        // An agent is registered by the subject's own user, root included.
+        let refused = |result: Result<(AgentProcess, String), String>| result.err();
+        let not_authorized = Some(NOT_AUTHORIZED.to_string());
+        assert_eq!(
+            refused(bus.agent("daemon", "x|session|c2|0")),
+            not_authorized
+        );
+        let nobody_process = format!("x|process|{}|1", nobody_app.pid());
+        assert_eq!(
+            refused(bus.agent("daemon", &nobody_process)),
+            not_authorized
+        );
+        assert_eq!(refused(bus.agent("root", "x|session|c2|1")), not_authorized);
+
+        let (_daemon_agent, _) = bus.agent("daemon", "daemon|session|c4|1").unwrap();
+        let (mut nobody_agent, _) = bus.agent("nobody", "nobody|session|c2|0").unwrap();
+        // One agent per subject, besides fallbacks.
+        assert_eq!(
+            refused(bus.agent("nobody", "x|session|c2|0")),
+            Some(FAILED.to_string())
+        );
+        let (nobody_fallback, _) = bus.agent("nobody", "nobody-fallback|session|c2|1").unwrap();
+        // pkttyagent's kind: an agent for one process.
+        let for_the_process = format!("x|process|{}|0", nobody_app.pid());
+        let (_process_agent, _) = bus.agent("nobody", &for_the_process).unwrap();
+
+        // root's process in nobody's session (sudo at the seat) and daemon's (su daemon there):
+        // no agent of theirs, so a challenge, and no dialog anywhere.
+        let root_app = Sleeper::start(None);
+        bus.place(root_app.pid(), ByPid::Session("c2"));
+        let daemon_in_c2 = Sleeper::start(Some("daemon"));
+        bus.place(daemon_in_c2.pid(), ByPid::Session("c2"));
+        for app in [&root_app, &daemon_in_c2] {
+            let answer = bus
+                .check_with(&unix_process(app.pid()), SELF, HashMap::new(), ALLOW, "")
+                .await;
+            assert_eq!(answer, Ok((false, true, no_details())));
+        }
+        assert!(dialogs.none_pending());
+
+        // daemon's own process in its session: its fallback agent. auth_admin: daemon is no
+        // administrator, so the administrators (nobody, bin) are offered; the helper answers
+        // with the agent's user and one of them.
+        let daemon_app = Sleeper::start(Some("daemon"));
+        bus.place(daemon_app.pid(), ByPid::Session("c4"));
+        let daemon_subject = unix_process(daemon_app.pid());
+        let checking = bus.check_with(&daemon_subject, ADMIN, HashMap::new(), ALLOW, "");
+        let helping = async {
+            let dialog = dialogs.next().await;
+            assert_eq!(dialog.agent, "daemon");
+            assert_eq!(dialog.identities, [BIN, NOBODY]);
+            assert_eq!(bus.respond(DAEMON, &dialog.cookie, NOBODY).await, Ok(()));
+            dialog.agent_returns().await;
+        };
+        let (answer, ()) = futures_lite::future::zip(checking, helping).await;
+        assert_eq!(answer, Ok((true, false, no_details())));
+
+        // nobody's process: the agent registered for it, then the session's, then the fallback.
+        let nobody_subject = unix_process(nobody_app.pid());
+        let other_nobody_app = Sleeper::start(Some("nobody"));
+        bus.place(other_nobody_app.pid(), ByPid::Session("c2"));
+        let other_subject = unix_process(other_nobody_app.pid());
+        assert_eq!(bus.agent_for(&dialogs, &nobody_subject).await, "x");
+        assert_eq!(bus.agent_for(&dialogs, &other_subject).await, "nobody");
+
+        // Only the connection that registered an agent unregisters it.
+        let unregister = bus
+            .client
+            .call_method(
+                Some(NAME),
+                PATH,
+                Some(INTERFACE),
+                "UnregisterAuthenticationAgent",
+                &(unix_session("c2"), AGENT_PATH),
+            )
+            .await
+            .map(|_| ())
+            .map_err(error_name);
+        assert_eq!(unregister, Err(FAILED.to_string()));
+        assert_eq!(nobody_agent.unregister(), "unregistered");
+        assert_eq!(
+            bus.agent_for(&dialogs, &other_subject).await,
+            "nobody-fallback"
+        );
+
+        // An agent whose connection leaves the bus is removed.
+        drop(nobody_fallback);
+        bus.logged("removed (its connection left the bus)");
+        let answer = bus
+            .check_with(&other_subject, SELF, HashMap::new(), ALLOW, "")
+            .await;
+        assert_eq!(answer, Ok((false, true, no_details())));
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn temporary_authorizations_keep_their_subject_and_level() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("temporary", "").await;
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let dialogs = bus.relay().await;
+        let (agent, agent_name) = bus.agent("nobody", "nobody|session|c2|0").unwrap();
+        let app = Sleeper::start(Some("nobody"));
+        bus.place(app.pid(), ByPid::Session("c2"));
+        let other_app = Sleeper::start(Some("nobody"));
+        bus.place(other_app.pid(), ByPid::Session("c2"));
+        let subject = unix_process(app.pid());
+        let changed = MatchRule::builder()
+            .msg_type(MessageType::Signal)
+            .interface(INTERFACE)
+            .unwrap()
+            .member("Changed")
+            .unwrap()
+            .build();
+        let mut changes = MessageStream::for_match_rule(changed, &bus.client, None)
+            .await
+            .unwrap();
+
+        // Before: a challenge that says it would be kept.
+        let (_, _, details) = bus
+            .check_with(&subject, SELF_KEEP, HashMap::new(), 0, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            details["polkit.retains_authorization_after_challenge"],
+            "true"
+        );
+
+        // auth_self_keep, authenticated once: kept, and Changed says so.
+        let (authorized, _, details) = bus
+            .authenticate(&dialogs, &subject, SELF_KEEP)
+            .await
+            .unwrap();
+        assert!(authorized);
+        let id = details["polkit.temporary_authorization_id"].clone();
+        assert_eq!(
+            details["polkit.retains_authorization_after_challenge"],
+            "true"
+        );
+        within("Changed", changes.next()).await.unwrap().unwrap();
+
+        // Used again for the same process, without a dialog or user interaction...
+        let again = bus
+            .check_with(&subject, SELF_KEEP, HashMap::new(), 0, "")
+            .await;
+        let by_id = HashMap::from([("polkit.temporary_authorization_id".to_string(), id.clone())]);
+        assert_eq!(again, Ok((true, false, by_id)));
+        assert_eq!(
+            bus.pkcheck(SELF_KEEP, &app.pid().to_string()),
+            Ok(PKCHECK_AUTHORIZED)
+        );
+        // ...but not for another process of the same user in the same session, nor for another
+        // action.
+        assert_eq!(
+            bus.check(&unix_process(other_app.pid()), SELF_KEEP).await,
+            Ok(CHALLENGED)
+        );
+        assert_eq!(bus.check(&subject, LEVELS).await, Ok(CHALLENGED));
+        assert!(dialogs.none_pending());
+
+        // Listed for its user: by process (root) and by session (nobody, as pkcheck --list-temp
+        // asks). Not for another user.
+        let listed: Vec<TemporaryAuthorization> = bus
+            .client
+            .call_method(
+                Some(NAME),
+                PATH,
+                Some(INTERFACE),
+                "EnumerateTemporaryAuthorizations",
+                &(&subject),
+            )
+            .await
+            .unwrap()
+            .body()
+            .deserialize()
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        let (listed_id, action, (kind, listed_subject), obtained, expires) = &listed[0];
+        assert_eq!(
+            (listed_id, action.as_str(), kind.as_str()),
+            (&id, SELF_KEEP, "unix-process")
+        );
+        assert_eq!(&*listed_subject["pid"], &Value::U32(app.pid()));
+        assert_eq!(expires - obtained, 300);
+        let in_session = ["(sa{sv})", "unix-session", "1", "session-id", "s", "c2"];
+        let (code, printed) =
+            bus.busctl_as("nobody", "EnumerateTemporaryAuthorizations", &in_session);
+        assert_eq!(code, Some(0), "{printed}");
+        assert!(printed.contains(&id), "{printed}");
+        let (code, printed) =
+            bus.busctl_as("daemon", "EnumerateTemporaryAuthorizations", &in_session);
+        assert_eq!(code, Some(1), "{printed}");
+
+        // Revoked by id: not by another user, by its own.
+        let (code, _) = bus.busctl_as("daemon", "RevokeTemporaryAuthorizationById", &["s", &id]);
+        assert_eq!(code, Some(1));
+        let (code, printed) =
+            bus.busctl_as("nobody", "RevokeTemporaryAuthorizationById", &["s", &id]);
+        assert_eq!(code, Some(0), "{printed}");
+        within("Changed", changes.next()).await.unwrap().unwrap();
+        assert_eq!(bus.check(&subject, SELF_KEEP).await, Ok(CHALLENGED));
+
+        // The user's own password, kept, never answers for an administrator's: in the foreground
+        // LEVELS asks auth_self_keep, in the background auth_admin_keep.
+        assert_eq!(
+            bus.authenticate(&dialogs, &subject, LEVELS)
+                .await
+                .map(|answer| answer.0),
+            Ok(true)
+        );
+        assert_eq!(bus.check(&subject, LEVELS).await, Ok(YES));
+        let inactive = FakeSession {
+            active: false,
+            ..NOBODY_ACTIVE
+        };
+        bus.change_session("c2", inactive).await;
+        assert_eq!(bus.check(&subject, LEVELS).await, Ok(CHALLENGED));
+        // nobody is an administrator: their own password is an administrator's.
+        assert_eq!(
+            bus.authenticate(&dialogs, &subject, LEVELS)
+                .await
+                .map(|answer| answer.0),
+            Ok(true)
+        );
+        assert_eq!(bus.check(&subject, LEVELS).await, Ok(YES));
+        // An administrator's answers for the user's own.
+        bus.change_session("c2", NOBODY_ACTIVE).await;
+        assert_eq!(bus.check(&subject, LEVELS).await, Ok(YES));
+
+        // Rereading the rules drops them all.
+        bus.reload();
+        bus.logged("temporary authorizations revoked: the rules were reread");
+        assert_eq!(bus.check(&subject, LEVELS).await, Ok(CHALLENGED));
+
+        // One kept for a bus name (here the agent's own connection) goes when the name leaves.
+        bus.place(agent.child.id(), ByPid::Session("c2"));
+        let by_name = bus_name(&agent_name);
+        let (authorized, _, details) = bus
+            .authenticate(&dialogs, &by_name, SELF_KEEP)
+            .await
+            .unwrap();
+        assert!(authorized);
+        let id = details["polkit.temporary_authorization_id"].clone();
+        let in_c2 = |bus: &Harness| {
+            let (code, printed) =
+                bus.busctl_as("nobody", "EnumerateTemporaryAuthorizations", &in_session);
+            assert_eq!(code, Some(0), "{printed}");
+            printed
+        };
+        assert!(in_c2(&bus).contains(&id));
+        drop(agent);
+        bus.logged("revoked: it left the bus");
+        assert!(!in_c2(&bus).contains(&id));
     });
 }
