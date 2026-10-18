@@ -176,10 +176,11 @@ Unknown actions are denied before any rule is looked at, so no rule can grant an
 installed program defines. An action id defined in two action files is unknown too: which
 definition is right cannot be known.
 
-**Root is authorized for every action, before any of this.** A subject whose user is uid 0 gets
-"authorized" (`yes`) from `CheckAuthorization`, as in polkitd: no rule, no default and no
-definition of the action is looked at, so a `no` rule, a default of `no` and an unknown action all
-answer yes for root, and broken rules (which deny everyone else) do not stop root. Why:
+**Root is authorized for every known action, before the rules.** A subject whose user is uid 0
+gets "authorized" (`yes`) from `CheckAuthorization`, as in polkitd: no rule and no default is
+looked at, so a `no` rule and a default of `no` answer yes for root, and broken rules (which deny
+everyone else) do not stop root. An unknown action is still refused, for root too, before this
+case (see above). Why:
 
 - root can do everything the answer would guard anyway: a refusal protects nothing, and only
   breaks programs that ask on root's behalf;
@@ -188,10 +189,12 @@ answer yes for root, and broken rules (which deny everyone else) do not stop roo
 
 The check comes once the subject is identified (see "Subjects") and after the rule that only root
 or an `org.freedesktop.policykit.owner` user may ask about another user's subject, so that rule
-holds for root's subjects too. The uid is the one that identification found: read under the
-process's pidfd, from the bus for a bus name, from logind for a session. A PID reused after the
-read cannot turn a user's process into root's. The rules cannot take this away: it is not a rule.
-pkcheck has no case of its own; it asks the authority and prints what it answers.
+holds for root's subjects too. It applies only when the subject's uid is known race-free: a bus
+name (the bus's credentials), a session (logind), or a process whose client sent the uid it saw
+and it matched the one read. A `unix-process` subject without a uid is only read from `/proc`, so
+it has no shortcut: the rules and defaults decide, as for any user. pkcheck always sends the uid.
+The rules cannot take this away: it is not a rule. pkcheck has no case of its own; it asks the
+authority and prints what it answers.
 
 ## Rules
 

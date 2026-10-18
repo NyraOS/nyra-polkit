@@ -746,6 +746,12 @@ fn unix_process_with(pid: u32, start_time: u64, uid: Option<i32>) -> Subject {
     ("unix-process", details)
 }
 
+/// A process subject with the uid the client saw.
+fn unix_process_with_uid(pid: u32, uid: u32) -> Subject {
+    let start_time = Process::open(pid).unwrap().start_time().unwrap();
+    unix_process_with(pid, start_time, Some(uid as i32))
+}
+
 fn bus_name(name: &str) -> Subject {
     (
         "system-bus-name",
@@ -846,8 +852,15 @@ fn answers_from_rules_and_defaults_for_every_subject_kind() {
         bus.add_session("c2", NOBODY_ACTIVE).await;
         let nobody = Sleeper::start(Some("nobody"));
         bus.place(nobody.pid(), ByPid::Session("c2"));
+        // A connection of nobody's: a fake agent, whose own name is the subject.
+        let (connection, connection_name) = bus.agent("nobody", "x|session|c2|0").unwrap();
+        bus.place(connection.child.id(), ByPid::Session("c2"));
 
-        for subject in [unix_process(nobody.pid()), unix_session("c2")] {
+        for subject in [
+            unix_process(nobody.pid()),
+            bus_name(&connection_name),
+            unix_session("c2"),
+        ] {
             assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES), "{subject:?}");
             assert_eq!(bus.check(&subject, RULED).await, Ok(YES), "{subject:?}");
             assert_eq!(bus.check(&subject, DENIED).await, Ok(NO), "{subject:?}");
@@ -870,36 +883,61 @@ fn answers_from_rules_and_defaults_for_every_subject_kind() {
 
 #[test]
 #[ignore = "needs root and dbus-daemon: run by the integration job"]
-fn root_is_authorized_for_every_action() {
+fn root_is_authorized_for_every_known_action() {
     futures_lite::future::block_on(async {
         let bus = Harness::start("root-authorized", "").await;
         // No session for root's processes: the default is allow_any, "no" for DEFAULT.
         let root = Sleeper::start(None);
         let own_name = bus.client.unique_name().unwrap().to_string();
+        bus.add_session("c1", LOCAL_ACTIVE).await;
 
-        for subject in [unix_process(root.pid()), bus_name(&own_name)] {
-            // A default of "no", a rule that says "no", a challenge and an unknown action.
-            for action in [DEFAULT, DENIED, CHALLENGE, UNKNOWN] {
-                assert_eq!(bus.check(&subject, action).await, Ok(YES), "{subject:?}");
+        // Subjects whose uid is known race-free: a process whose client sent the uid it saw, a bus
+        // name and a session.
+        let subjects = [
+            unix_process_with_uid(root.pid(), 0),
+            bus_name(&own_name),
+            unix_session("c1"),
+        ];
+        for subject in &subjects {
+            // A default of "no", a rule that says "no" and a challenge: yes, for root.
+            for action in [DEFAULT, DENIED, CHALLENGE] {
+                assert_eq!(bus.check(subject, action).await, Ok(YES), "{subject:?}");
             }
+            // An unknown action is refused before root is looked at.
+            assert_eq!(bus.check(subject, UNKNOWN).await, Ok(NO), "{subject:?}");
         }
         let pid = root.pid().to_string();
-        for action in [DEFAULT, DENIED, CHALLENGE, UNKNOWN] {
+        for action in [DEFAULT, DENIED, CHALLENGE] {
             assert_eq!(bus.pkcheck(action, &pid), Ok(PKCHECK_AUTHORIZED));
         }
+        assert_eq!(bus.pkcheck(UNKNOWN, &pid), Ok(PKCHECK_NOT_AUTHORIZED));
+
+        // A process without the uid the client saw has no shortcut: the rules and the defaults
+        // decide, as for anyone.
+        let unconfirmed = unix_process(root.pid());
+        assert_eq!(bus.check(&unconfirmed, DEFAULT).await, Ok(NO));
+        assert_eq!(bus.check(&unconfirmed, DENIED).await, Ok(NO));
+        assert_eq!(bus.check(&unconfirmed, CHALLENGE).await, Ok(CHALLENGED));
+        // A uid that is not the process's is an error, not a shortcut.
+        let wrong = unix_process_with_uid(root.pid(), NOBODY);
+        assert_eq!(
+            bus.check(&wrong, DEFAULT).await,
+            Err(NOT_AUTHORIZED.to_string())
+        );
 
         // Even with rules that cannot be read.
         let mut changes = changed_signals(&bus).await;
         write_trusted(&bus.directory.join("local/90-local.toml"), BROKEN_RULES);
         bus.reload();
         within("Changed", changes.next()).await.unwrap().unwrap();
-        let subject = unix_process(root.pid());
-        assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
+        assert_eq!(bus.check(&subjects[0], DEFAULT).await, Ok(YES));
+        assert_eq!(bus.check(&unconfirmed, DEFAULT).await, Ok(NO));
 
         // Only uid 0: nobody's process is still denied.
         let nobody = Sleeper::start(Some("nobody"));
         assert_eq!(
-            bus.check(&unix_process(nobody.pid()), DEFAULT).await,
+            bus.check(&unix_process_with_uid(nobody.pid(), NOBODY), DEFAULT)
+                .await,
             Ok(NO)
         );
     });
@@ -1001,7 +1039,8 @@ fn another_users_session_is_not_local() {
             bus.check(&unix_process(nobody_in_own.pid()), DEFAULT).await,
             Ok(YES)
         );
-        // root keeps the session it is in: `sudo` at the seat.
+        // root keeps the session it is in: `sudo` at the seat. This subject carries no uid from the
+        // client, so the session's default decides, as for anyone.
         let root_in_nobodys = Sleeper::start(None);
         bus.place(root_in_nobodys.pid(), ByPid::Session("c2"));
         assert_eq!(
@@ -1655,10 +1694,12 @@ impl Drop for UnitMemoryCgroup {
 fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
     futures_lite::future::block_on(async {
         let mut bus = Harness::start("large-call", "").await;
-        bus.add_session("c1", LOCAL_ACTIVE).await;
-        bus.place(me(), ByPid::Session("c1"));
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let nobody = Sleeper::start(Some("nobody"));
+        bus.place(nobody.pid(), ByPid::Session("c2"));
         let cgroup = UnitMemoryCgroup::place(bus.daemon.id());
-        let subject = unix_process(me());
+        // Not root's: only a check that reaches the rules copies the details.
+        let subject = unix_process(nobody.pid());
 
         // About 31 MiB of details (24 bytes each on the wire), under the bus's 32 MiB per message:
         // turned into Rust values, they take far more.
@@ -2373,6 +2414,32 @@ fn agents_only_get_requests_of_their_own_user() {
         let answer = bus
             .check_with(
                 &unix_process(daemon_in_c2.pid()),
+                SELF,
+                HashMap::new(),
+                ALLOW,
+                "",
+            )
+            .await;
+        assert_eq!(answer, Ok((false, true, no_details())));
+        assert!(dialogs.none_pending());
+
+        // root's process in nobody's session (sudo at the seat): authorized, so no dialog. Without
+        // the uid the client saw, the rules decide and root has no agent: a challenge.
+        let root_in_c2 = Sleeper::start(None);
+        bus.place(root_in_c2.pid(), ByPid::Session("c2"));
+        let answer = bus
+            .check_with(
+                &unix_process_with_uid(root_in_c2.pid(), 0),
+                SELF,
+                HashMap::new(),
+                ALLOW,
+                "",
+            )
+            .await;
+        assert_eq!(answer, Ok((true, false, no_details())));
+        let answer = bus
+            .check_with(
+                &unix_process(root_in_c2.pid()),
                 SELF,
                 HashMap::new(),
                 ALLOW,

@@ -458,12 +458,12 @@ fn the_same_answers_as_debians_pkcheck() {
     with_details.extend(["--detail", "k", "v", "-d", "føl,你好", "x"].map(String::from));
     same_as_root(&with_details, 0, Same);
 
-    // Root is authorized for everything: whatever a rule or the default says, even for an
-    // unknown action.
+    // Root is authorized for every known action, whatever a rule or the default says; an unknown
+    // action is not authorized, for root too.
     same_as_root(&check(DENIED, &pid), 0, Same);
     same_as_root(&check(DEFAULT, &full), 0, Same);
-    same_as_root(&check(UNKNOWN, &pid), 0, Same);
     same_as_root(&check(CHALLENGE, &pid), 0, Same);
+    same_as_root(&check(UNKNOWN, &pid), 1, Same);
 
     // Not authorized, for nobody's own process (no session): a rule says no, the default says no,
     // or the action is unknown.

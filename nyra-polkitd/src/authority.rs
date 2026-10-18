@@ -541,10 +541,15 @@ impl Authority {
                 ));
             }
         }
-        // Root is authorized for everything, before the rules and the defaults, as in polkitd
-        // (docs/DESIGN.md, "Root"). `identified.uid` was read under the process's pidfd or from
-        // the bus, so a PID reuse cannot make a non-root subject root.
-        if identified.uid == 0 {
+        // Root is authorized for every action that exists, before the rules and the defaults
+        // (docs/DESIGN.md, "Root"): refusing root protects nothing and breaks programs that ask on
+        // its behalf. Unknown actions are refused first, for root too. The shortcut is only for a
+        // uid that cannot change between the request and the read; for any other subject the
+        // rules decide, as for every user.
+        if identified.uid == 0
+            && subject::uid_is_race_free(&kind, &subject_details)
+            && self.read_policy().actions.contains_key(action_id)
+        {
             return Ok(answer(Authorization::Yes));
         }
         // What the decision needs from the policy is taken here: the lock is not held across the
