@@ -545,19 +545,21 @@ Cookies are never logged.
   instead of hanging. Clients: Debian's `pkcheck`, `busctl` (for the subjects `pkcheck` cannot send,
   `unix-session`) and our `pkcheck`, run next to Debian's with the same options (same exit codes,
   0, 1, 2, 126, 127, the same details and the same or comparable diagnostics; `tests/compat.rs` of
-  `nyra-pkcheck`), `libpolkit-gobject-1` through GObject introspection (`CheckAuthorization`, `EnumerateActions`, temporary authorizations, cancellation),
-  and the real agent stack: Debian's `pkttyagent` (on `libpolkit-agent-1`) in a pseudo-terminal
-  from `script`, with Debian 13's setuid `polkit-agent-helper-1`, PAM and test users that the test
-  makes with random passwords. It covers the right and a wrong password, `auth_self`, `auth_admin`
-  (an administrator chosen among the identities offered), `auth_self_keep` and its authorization
-  used again without a dialog, a cancellation by the caller, the end of input, Ctrl-C and a killed
+  `nyra-pkcheck`), and the real agent stack: Debian's `pkttyagent` (on `libpolkit-agent-1`) in a
+  pseudo-terminal from `script`, with Debian 13's setuid `polkit-agent-helper-1`, PAM and test users
+  that the test makes with random passwords, no login shell, and removes when it ends. It covers
+  the right and a wrong password, `auth_self`, `auth_admin` (an administrator chosen among the
+  identities offered), `auth_self_keep` and its authorization used again without a dialog, a
+  cancellation by the caller, the end of input, Ctrl-C and a killed
   agent. The helper does not follow `DBUS_SYSTEM_BUS_ADDRESS` and connects to the system bus's own
   socket, so that test's bus listens there too, in a container where no system bus runs. For the
   protocol's corner cases the tests also have their own agent: the test binary, run again as
   another user, registers as an agent and passes each dialog on to the test, which answers
-  `AuthenticationAgentResponse2` as root, like the helper. The bus traffic of these
-  clients is recorded, which is how the subject details they send are confirmed. The same `pkcheck` matrix also runs against Debian's polkitd (default
-  rules only), and the answers must match.
+  `AuthenticationAgentResponse2` as root, like the helper. Planned, not written yet:
+  `libpolkit-gobject-1` through GObject introspection (`CheckAuthorization`,
+  `EnumerateActions`, temporary authorizations, cancellation); recorded bus traffic of the
+  clients, to confirm the subject details they send; and the same `pkcheck` matrix against
+  Debian's polkitd (default rules only), whose answers must match.
 - **In the Nyra OS image** (later, before it replaces polkitd there): the image's own test battery
   in a VM, with a KDE session, NetworkManager, udisks2 and Flatpak.
 
@@ -597,7 +599,8 @@ Read for this design; nothing from polkit's source code.
   (`/usr/share/dbus-1/system.conf`: `max_connections_per_user` 256, `max_replies_per_connection`
   128): <https://dbus.freedesktop.org/doc/dbus-daemon.1.html>
 - org.freedesktop.login1(5) (`GetSession`, `GetSessionByPID`, `Session.Active`, `Session.Remote`,
-  `Session.User`, `User.Display`): <https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html>
+  `Session.User`, `User.Display`):
+  <https://www.freedesktop.org/software/systemd/man/latest/org.freedesktop.login1.html>
 - Linux man pages: pidfd_open(2), proc(5) (`/proc/<pid>/stat` start time, `status` `Uid:`,
   `fdinfo` `Pid:`).
 - Observed: action files installed on Debian 13 by systemd and others (`<annotate>` values are the

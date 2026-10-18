@@ -2811,9 +2811,29 @@ const TEST_USER: &str = "nyra-test-user";
 const TEST_ADMIN: &str = "nyra-test-admin";
 const TEST_ADMINS: &str = "nyra-test-admins";
 
-/// Makes the user `name` if it does not exist (in `group` too, if given), and gives it a new random
-/// password, which is returned: no password is written in the repository or in a log.
-fn user_with_password(name: &str, group: Option<&str>) -> String {
+/// The users and groups the test made, removed when it ends, also when it fails. Those that existed
+/// before the test are not recorded, so they stay.
+#[derive(Default)]
+struct MadeAccounts {
+    users: Vec<String>,
+    groups: Vec<String>,
+}
+
+impl Drop for MadeAccounts {
+    fn drop(&mut self) {
+        for user in &self.users {
+            let _ = Command::new("userdel").arg(user).status();
+        }
+        for group in &self.groups {
+            let _ = Command::new("groupdel").arg(group).status();
+        }
+    }
+}
+
+/// Makes the user `name` if it does not exist (in `group` too, if given) with no login shell, notes
+/// in `made` what it made, and gives the user a new random password, which is returned: no password
+/// is written in the repository or in a log.
+fn user_with_password(made: &mut MadeAccounts, name: &str, group: Option<&str>) -> String {
     let run = |program: &str, arguments: &[&str]| {
         let status = Command::new(program).args(arguments).status().unwrap();
         assert!(status.success(), "{program} {arguments:?}: {status}");
@@ -2828,14 +2848,22 @@ fn user_with_password(name: &str, group: Option<&str>) -> String {
     if let Some(group) = group {
         if !exists("group", group) {
             run("groupadd", &[group]);
+            made.groups.push(group.to_string());
         }
     }
     if !exists("passwd", name) {
-        let mut arguments = vec!["--no-create-home", "--user-group", name];
+        let mut arguments = vec![
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            "--user-group",
+            name,
+        ];
         if let Some(group) = group {
             arguments.extend(["--groups", group]);
         }
         run("useradd", &arguments);
+        made.users.push(name.to_string());
     }
     let mut random = [0u8; 16];
     rustix::rand::getrandom(&mut random, rustix::rand::GetRandomFlags::empty()).unwrap();
@@ -3008,9 +3036,11 @@ fn debians_agent_and_helper_check_real_passwords() {
             "{HELPER} is not setuid root"
         );
         let rules = format!("[administrators]\ngroups = [\"{TEST_ADMINS}\"]\n");
+        // Declared first, so it is dropped last: after the agents and the bus are gone.
+        let mut made = MadeAccounts::default();
         let bus = Harness::start_on_system_socket("real-agent", &rules).await;
-        let user_password = user_with_password(TEST_USER, None);
-        let admin_password = user_with_password(TEST_ADMIN, Some(TEST_ADMINS));
+        let user_password = user_with_password(&mut made, TEST_USER, None);
+        let admin_password = user_with_password(&mut made, TEST_ADMIN, Some(TEST_ADMINS));
         let (user, admin) = (uid_of(TEST_USER), uid_of(TEST_ADMIN));
         let app = Sleeper::start(Some(TEST_USER));
         let mut agent = TtyAgent::start(&bus, TEST_USER, app.pid());
