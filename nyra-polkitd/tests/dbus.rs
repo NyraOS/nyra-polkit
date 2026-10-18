@@ -1709,7 +1709,8 @@ fn fake_agent_program() {
     futures_lite::future::block_on(run_fake_agent(&spec));
 }
 
-/// `spec`: `<label>|session|<session id>|<fallback: 0 or 1>` or `<label>|process|<pid>|<fallback>`.
+/// `spec`: `<label>|session|<session id>|<fallback: 0 or 1>`, `<label>|process|<pid>|<fallback>`
+/// or `<label>|bus-name|self|<fallback>` (for the agent's own connection).
 async fn run_fake_agent(spec: &str) {
     let [label, kind, subject, fallback] = spec.split('|').collect::<Vec<_>>()[..] else {
         panic!("fake agent: {spec:?}");
@@ -1732,6 +1733,7 @@ async fn run_fake_agent(spec: &str) {
     let subject = match kind {
         "session" => unix_session(subject),
         "process" => unix_process(subject.parse().unwrap()),
+        "bus-name" => bus_name(connection.unique_name().unwrap().as_str()),
         _ => panic!("fake agent: {spec:?}"),
     };
     let options = HashMap::from([("fallback", Value::Bool(fallback == "1"))]);
@@ -2038,6 +2040,20 @@ const NOBODY_ACTIVE: FakeSession = FakeSession {
     ..LOCAL_ACTIVE
 };
 
+/// The authority's `Changed` signals from now on.
+async fn changed_signals(bus: &Harness) -> MessageStream {
+    let changed = MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .interface(INTERFACE)
+        .unwrap()
+        .member("Changed")
+        .unwrap()
+        .build();
+    MessageStream::for_match_rule(changed, &bus.client, None)
+        .await
+        .unwrap()
+}
+
 const UNKNOWN_COOKIE: &str = "0123456789abcdef0123456789abcdef";
 
 fn no_details() -> HashMap<String, String> {
@@ -2150,6 +2166,21 @@ fn an_agent_authenticates_only_with_the_helpers_answer() {
         // Cookies are never logged.
         let log = bus.log();
         assert!(!log.contains(UNKNOWN_COOKIE), "{log}");
+
+        // A root caller gives the dialog its own text and icon.
+        let own_text = HashMap::from([
+            ("polkit.message", "The service's own text"),
+            ("polkit.icon_name", "service-icon"),
+        ]);
+        let checking = bus.check_with(&subject, SELF, own_text, ALLOW, "");
+        let helping = async {
+            let dialog = dialogs.next().await;
+            assert_eq!(dialog.message, "The service's own text");
+            assert_eq!(dialog.icon_name, "service-icon");
+            dialog.dismiss().await;
+        };
+        let (answer, ()) = futures_lite::future::zip(checking, helping).await;
+        assert_eq!(answer.map(|answer| answer.0), Ok(false));
 
         // pkcheck --allow-user-interaction, end to end.
         let pid = app.pid().to_string();
@@ -2443,6 +2474,28 @@ fn temporary_authorizations_keep_their_subject_and_level() {
         within("Changed", changes.next()).await.unwrap().unwrap();
         assert_eq!(bus.check(&subject, SELF_KEEP).await, Ok(CHALLENGED));
 
+        // Revoked for its subject, by root: gone, and Changed says so. A new stream, so that only
+        // what comes after this point is seen.
+        bus.authenticate(&dialogs, &subject, SELF_KEEP)
+            .await
+            .unwrap();
+        let mut changes_now = changed_signals(&bus).await;
+        bus.client
+            .call_method(
+                Some(NAME),
+                PATH,
+                Some(INTERFACE),
+                "RevokeTemporaryAuthorizations",
+                &(&subject),
+            )
+            .await
+            .unwrap();
+        within("Changed", changes_now.next())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bus.check(&subject, SELF_KEEP).await, Ok(CHALLENGED));
+
         // The user's own password, kept, never answers for an administrator's: in the foreground
         // LEVELS asks auth_self_keep, in the background auth_admin_keep.
         assert_eq!(
@@ -2491,8 +2544,13 @@ fn temporary_authorizations_keep_their_subject_and_level() {
             printed
         };
         assert!(in_c2(&bus).contains(&id));
+        let mut changes_now = changed_signals(&bus).await;
         drop(agent);
         bus.logged("revoked: it left the bus");
+        within("Changed", changes_now.next())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!in_c2(&bus).contains(&id));
     });
 }
@@ -2646,5 +2704,66 @@ fn a_queued_check_goes_to_the_agent_that_serves_it_at_its_turn() {
         let dismissed = HashMap::from([("polkit.dismissed".to_string(), "true".to_string())]);
         assert_eq!(first, Ok((false, false, dismissed.clone())));
         assert_eq!(second, Ok((false, false, dismissed)));
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn bus_name_and_fallback_agents_are_chosen_as_documented() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("agent-order", "").await;
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let dialogs = bus.relay().await;
+        let app = Sleeper::start(Some("nobody"));
+        bus.place(app.pid(), ByPid::Session("c2"));
+        let (_session_agent, _) = bus.agent("nobody", "session|session|c2|0").unwrap();
+        let for_the_process = format!("process-fallback|process|{}|1", app.pid());
+        let (_process_fallback, _) = bus.agent("nobody", &for_the_process).unwrap();
+        // pkttyagent --system-bus-name: here the agent's own connection.
+        let (by_name_agent, by_name) = bus.agent("nobody", "by-name|bus-name|self|0").unwrap();
+        bus.place(by_name_agent.child.id(), ByPid::Session("c2"));
+
+        // A fallback for the process gives way to the session's agent that is not one.
+        assert_eq!(
+            bus.agent_for(&dialogs, &unix_process(app.pid())).await,
+            "session"
+        );
+        // The agent registered for a bus name gets that bus name's requests.
+        assert_eq!(
+            bus.agent_for(&dialogs, &bus_name(&by_name)).await,
+            "by-name"
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs root and dbus-daemon: run by the integration job"]
+fn a_check_sent_just_before_leaving_counts_nowhere() {
+    futures_lite::future::block_on(async {
+        let bus = Harness::start("late-check", "").await;
+        bus.add_session("c2", NOBODY_ACTIVE).await;
+        let dialogs = bus.relay().await;
+        let (_agent, _) = bus.agent("nobody", "nobody|session|c2|0").unwrap();
+        let app = Sleeper::start(Some("nobody"));
+        bus.place(app.pid(), ByPid::Session("c2"));
+        let subject = unix_process(app.pid());
+        // A caller with a check in a dialog sends one more and leaves at once: the second may be
+        // handled after the departure. Repeated, as the order is up to the scheduler.
+        for _ in 0..40 {
+            let leaving = connect(&bus.address).await;
+            send_interactive_check(&leaving, &subject, SELF).await;
+            let dialog = dialogs.next().await;
+            send_interactive_check(&leaving, &subject, SELF).await;
+            leaving.close().await.unwrap();
+            dialogs.cancelled().await;
+            dialog.dismiss().await;
+        }
+        // The daemon is whole: no panic, and checks and dialogs work as before.
+        assert_eq!(
+            bus.authenticate(&dialogs, &subject, SELF).await,
+            Ok((true, false, no_details()))
+        );
+        let log = bus.log();
+        assert!(!log.contains("panicked"), "{log}");
     });
 }

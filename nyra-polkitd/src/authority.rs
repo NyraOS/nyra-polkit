@@ -161,15 +161,18 @@ struct ChecksInFlight {
     authentications: HashMap<u32, usize>,
 }
 
+/// The checks of one caller. The entry lives as long as the caller has checks, also once the
+/// caller has left the bus: its checks end then, but each still ends through its own guards, which
+/// count here. A message the caller sent just before leaving may be handled after it left; its
+/// check is refused, so it never counts in an entry that is ending.
 struct CallerChecks {
-    /// Checks in the connection's slots.
+    /// All the caller's checks in flight.
     count: usize,
-    /// Checks in an authentication: not in the slots, but the caller still has them.
+    /// Those in an authentication: they do not take the connection's slots.
     authenticating: usize,
     cancellable: HashMap<String, async_channel::Sender<()>>,
-    /// Never sent on, only kept: dropped with this when the caller leaves the bus, which closes
-    /// the channel and so ends every check of the caller.
-    _left: async_channel::Sender<()>,
+    /// Never sent on: closed when the caller leaves the bus, which ends every check of the caller.
+    left: async_channel::Sender<()>,
     left_receiver: async_channel::Receiver<()>,
 }
 
@@ -180,7 +183,7 @@ impl Default for CallerChecks {
             count: 0,
             authenticating: 0,
             cancellable: HashMap::new(),
-            _left: left,
+            left,
             left_receiver,
         }
     }
@@ -215,7 +218,10 @@ impl ChecksInFlight {
     /// Counts a new check of `caller`; returns what ends it early.
     fn begin(&mut self, caller: &str, cancellation_id: &str) -> Result<Cancellation, Error> {
         let checks = self.by_caller.entry(caller.to_string()).or_default();
-        if checks.count >= MAX_CHECKS_PER_CONNECTION {
+        if checks.left.is_closed() {
+            return Err(Error::Failed("the caller left the bus".to_string()));
+        }
+        if checks.count - checks.authenticating >= MAX_CHECKS_PER_CONNECTION {
             return Err(Error::Failed(format!(
                 "too many checks in flight (at most {MAX_CHECKS_PER_CONNECTION} per connection)"
             )));
@@ -240,9 +246,11 @@ impl ChecksInFlight {
         })
     }
 
-    /// Ends every check of a caller that left the bus.
+    /// Ends every check of a caller that left the bus; the entry goes with its last check.
     fn caller_left(&mut self, caller: &str) {
-        self.by_caller.remove(caller);
+        if let Some(checks) = self.by_caller.get(caller) {
+            checks.left.close();
+        }
     }
 
     fn end(&mut self, caller: &str, cancellation_id: &str) {
@@ -251,7 +259,7 @@ impl ChecksInFlight {
         };
         checks.count -= 1;
         checks.cancellable.remove(cancellation_id);
-        if checks.count == 0 && checks.authenticating == 0 {
+        if checks.count == 0 {
             self.by_caller.remove(caller);
         }
     }
@@ -284,8 +292,9 @@ impl ChecksInFlight {
         Ok(())
     }
 
-    /// A check of `caller` starts an authentication for user `uid`: counted for that user and no
-    /// longer in the caller's connection. False when the user already has too many.
+    /// A check of `caller` (in flight, after [`Self::begin`]) starts an authentication for user
+    /// `uid`: counted for that user and no longer in the caller's connection slots. False when the
+    /// user already has too many.
     fn begin_authentication(&mut self, caller: &str, uid: u32) -> bool {
         let count = self.authentications.entry(uid).or_default();
         if *count >= MAX_AUTHENTICATIONS_PER_USER {
@@ -293,13 +302,12 @@ impl ChecksInFlight {
         }
         *count += 1;
         if let Some(checks) = self.by_caller.get_mut(caller) {
-            checks.count -= 1;
             checks.authenticating += 1;
         }
         true
     }
 
-    /// The authentication ended: the check counts in its caller's connection again until it ends.
+    /// The authentication ended, before its check does.
     fn end_authentication(&mut self, caller: &str, uid: u32) {
         if let Some(count) = self.authentications.get_mut(&uid) {
             *count -= 1;
@@ -309,7 +317,6 @@ impl ChecksInFlight {
         }
         if let Some(checks) = self.by_caller.get_mut(caller) {
             checks.authenticating -= 1;
-            checks.count += 1;
         }
     }
 
@@ -1365,11 +1372,33 @@ mod tests {
         checks.end_authentication(":1.3", 65534);
         checks.end(":1.3", "");
         assert!(!checks.by_caller.contains_key(":1.3"));
-        // A caller that left: its authentications still end.
+        // A caller that left: its authentications still end, and its entry with its last check.
+        checks.begin(":1.2", "").unwrap();
         assert!(checks.begin_authentication(":1.2", 65534));
         checks.caller_left(":1.2");
         checks.end_authentication(":1.2", 65534);
+        checks.end(":1.2", "");
         assert!(checks.authentications.is_empty());
+        assert!(!checks.by_caller.contains_key(":1.2"));
+    }
+
+    #[test]
+    fn a_check_handled_after_its_caller_left_is_refused() {
+        // Check X of :1.9 is in an authentication; :1.9 leaves; a check Y that :1.9 sent before
+        // leaving is handled after the departure; then X ends.
+        let mut checks = ChecksInFlight::default();
+        let x = checks.begin(":1.9", "id").unwrap();
+        assert!(checks.begin_authentication(":1.9", 65534));
+        checks.caller_left(":1.9");
+        assert!(matches!(checks.begin(":1.9", "id"), Err(Error::Failed(_))));
+        futures_lite::future::block_on(x.wait());
+        checks.end_authentication(":1.9", 65534);
+        checks.end(":1.9", "id");
+        assert!(checks.by_caller.is_empty());
+        assert!(checks.authentications.is_empty());
+        // A departure with no check in flight leaves nothing behind.
+        checks.caller_left(":1.10");
+        assert!(checks.by_caller.is_empty());
     }
 
     #[test]
