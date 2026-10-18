@@ -338,7 +338,12 @@ struct FakeUserObject {
 impl FakeUserObject {
     #[zbus(property)]
     fn display(&self) -> (String, OwnedObjectPath) {
-        (self.display.to_string(), session_path(self.display))
+        // A user without a display session: logind answers ("", "/").
+        let path = match self.display {
+            "" => OwnedObjectPath::try_from("/").unwrap(),
+            id => session_path(id),
+        };
+        (self.display.to_string(), path)
     }
 }
 
