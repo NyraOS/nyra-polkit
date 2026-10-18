@@ -61,6 +61,12 @@ pub struct Action {
 /// Parses one `.policy` file. Unknown elements are ignored, as new polkit versions may add some;
 /// a malformed action, an unknown default or an invalid value fails the whole file.
 pub fn parse_policy(xml: &str) -> Result<Vec<Action>, String> {
+    // roxmltree's limits still allow an entity to expand to ~150 MB from 4 MiB, and it does not
+    // expose declarations, so look at the text. A match inside a comment refuses a harmless file,
+    // which is the safe side; XML is case-sensitive, so no other spelling declares an entity.
+    if xml.contains("<!ENTITY") {
+        return Err("the file declares an XML entity".to_string());
+    }
     // The files start with a <!DOCTYPE policyconfig ...>; roxmltree never loads the external DTD.
     let options = roxmltree::ParsingOptions {
         allow_dtd: true,
@@ -328,6 +334,17 @@ mod tests {
         let xml = format!("<policyconfig>{}</policyconfig>", "<x/>".repeat(250_000));
         let error = parse_policy(&xml).unwrap_err();
         assert!(error.contains("nodes limit reached"), "{error}");
+    }
+
+    #[test]
+    fn accepts_the_usual_doctype_and_refuses_entities() {
+        assert!(parse_policy(POLICY).is_ok());
+        let entity = r#"<!DOCTYPE policyconfig [<!ENTITY v "Example">]>
+<policyconfig><vendor>&v;</vendor></policyconfig>"#;
+        let error = parse_policy(entity).unwrap_err();
+        assert!(error.contains("entity"), "{error}");
+        let parameter_entity = r#"<!DOCTYPE policyconfig [<!ENTITY % p "x">]><policyconfig/>"#;
+        assert!(parse_policy(parameter_entity).is_err());
     }
 
     #[test]

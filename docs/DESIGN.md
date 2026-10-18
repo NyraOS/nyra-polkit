@@ -174,7 +174,9 @@ default is `no`, including the ones installed later.
 
 Unknown actions are denied before any rule is looked at, so no rule can grant an action that no
 installed program defines. An action id defined in two action files is unknown too: which
-definition is right cannot be known.
+definition is right cannot be known. An action file that declares an XML entity (`<!ENTITY`) is
+refused as a whole, logged, and its actions are unknown: real files declare none, and expanding
+entities could blow a small file up to hundreds of megabytes. The usual `<!DOCTYPE>` line is fine.
 
 ## Rules
 
