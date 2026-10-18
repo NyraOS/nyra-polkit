@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 //! Our pkcheck next to Debian's, against nyra-polkitd on a private, system-like bus
 //! (docs/DESIGN.md, "Tests"): for the same options, both must exit with the same code, print the
-//! same details and comparable diagnostics. The bus is set up as in nyra-polkitd's `tests/dbus.rs`:
-//! the bus policy from `dist/`, the daemon as the `polkitd` user, and a fake logind that knows no
-//! session.
+//! same details and comparable diagnostics. The bus and the daemon are the shared harness's
+//! (`tests/common/harness.rs`, as in nyra-polkitd's `tests/dbus.rs`); the fake logind is this
+//! file's own and knows no session.
 //!
 //! Needs root, a writable `/sys/fs/cgroup` (to put pkcheck in a session's scope), `dbus-daemon`,
 //! Debian's `pkcheck`, `setpriv`, `setsid`, `timeout`, the users `polkitd` and `nobody`, and nyra-polkitd
@@ -12,12 +12,15 @@
 //!
 //! Every wait has a timeout, so a regression fails the test instead of hanging the job.
 
+// The harness shared with nyra-polkitd's tests/dbus.rs: one file, included with `#[path]` from
+// both crates' tests (why not a crate of its own: see the top of the file).
+#[path = "../../tests/common/harness.rs"]
+mod harness;
+
+use harness::Harness;
 use nyra_polkitd::process::Process;
-use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::process::{Child, Command, Output};
 use zbus::Connection;
 use zbus::zvariant::OwnedObjectPath;
 
@@ -71,8 +74,6 @@ const DENIED: &str = "org.nyra.test.denied";
 const CHALLENGE: &str = "org.nyra.test.challenge";
 const UNKNOWN: &str = "org.nyra.test.unknown";
 
-const TIMEOUT: Duration = Duration::from_secs(30);
-
 /// logind knowing no session: every process gets `allow_any`, and a `unix-session` subject is
 /// unknown.
 struct FakeManager;
@@ -103,48 +104,6 @@ impl FakeManager {
     }
 }
 
-/// A private bus with nyra-polkitd, the fake logind and a client connection on it.
-struct Harness {
-    directory: PathBuf,
-    address: String,
-    bus: Child,
-    daemon: Child,
-    _logind: Connection,
-    client: Connection,
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = self.daemon.kill();
-        let _ = self.daemon.wait();
-        let _ = self.bus.kill();
-        let _ = self.bus.wait();
-        if std::thread::panicking() {
-            let log = std::fs::read_to_string(self.directory.join("daemon.log"));
-            eprintln!("--- nyra-polkitd log ---\n{}", log.unwrap_or_default());
-        }
-        let _ = std::fs::remove_dir_all(&self.directory);
-    }
-}
-
-fn write_trusted(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, Permissions::from_mode(0o644)).unwrap();
-}
-
-fn make_directory(path: &Path) {
-    std::fs::create_dir_all(path).unwrap();
-    std::fs::set_permissions(path, Permissions::from_mode(0o755)).unwrap();
-}
-
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
 /// Our pkcheck, built by cargo for this test.
 const OURS: &str = env!("CARGO_BIN_EXE_pkcheck");
 
@@ -160,150 +119,20 @@ fn daemon_binary() -> PathBuf {
     path
 }
 
-impl Harness {
-    fn start(test: &str) -> Self {
-        assert!(
-            nix::unistd::geteuid().is_root(),
-            "the pkcheck integration tests need root (see the top of tests/compat.rs)"
-        );
-        let directory = std::env::temp_dir().join(format!("nyra-pkcheck-{test}"));
-        let _ = std::fs::remove_dir_all(&directory);
-        for sub in ["", "actions", "image", "local"] {
-            make_directory(&directory.join(sub));
-        }
-        write_trusted(&directory.join("actions/test.policy"), ACTIONS);
-        write_trusted(&directory.join("image/50-test.toml"), RULES);
-
-        let socket = directory.join("bus");
-        let policy = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../dist/org.freedesktop.PolicyKit1.conf")
-            .canonicalize()
-            .unwrap();
-        // As in tests/dbus.rs: the defaults of Debian's system bus, the fake logind's name and
-        // the daemon's own policy from dist/.
-        let config = format!(
-            r#"<busconfig>
-  <type>system</type>
-  <listen>unix:path={socket}</listen>
-  <auth>EXTERNAL</auth>
-  <policy context="default">
-    <allow user="*"/>
-    <deny own="*"/>
-    <deny send_type="method_call"/>
-    <allow send_type="signal"/>
-    <allow send_requested_reply="true" send_type="method_return"/>
-    <allow send_requested_reply="true" send_type="error"/>
-    <allow receive_type="method_call"/>
-    <allow receive_type="method_return"/>
-    <allow receive_type="error"/>
-    <allow receive_type="signal"/>
-    <allow send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus"/>
-    <allow send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus.Properties"/>
-  </policy>
-  <policy user="root">
-    <allow own="org.freedesktop.login1"/>
-  </policy>
-  <policy context="default">
-    <allow send_destination="org.freedesktop.login1"/>
-  </policy>
-  <include>{policy}</include>
-</busconfig>
-"#,
-            socket = socket.display(),
-            policy = policy.display()
-        );
-        write_trusted(&directory.join("bus.conf"), &config);
-        let bus = Command::new("dbus-daemon")
-            .arg(format!(
-                "--config-file={}",
-                directory.join("bus.conf").display()
-            ))
-            .args(["--nofork", "--nopidfile", "--nosyslog"])
-            .spawn()
-            .expect("dbus-daemon");
-        wait_until("the bus socket", || socket.exists());
-        let address = format!("unix:path={}", socket.display());
-
-        let connect = |builder: zbus::connection::Builder<'static>| {
-            futures_lite::future::block_on(builder.method_timeout(TIMEOUT).build()).unwrap()
-        };
-        let builder = || zbus::connection::Builder::address(address.as_str()).unwrap();
-        let logind = connect(
-            builder()
-                .serve_at("/org/freedesktop/login1", FakeManager)
-                .unwrap()
-                .name("org.freedesktop.login1")
-                .unwrap(),
-        );
-        let client = connect(builder());
-
-        let log = std::fs::File::create(directory.join("daemon.log")).unwrap();
-        let mut daemon = Command::new("setpriv")
-            .args(["--reuid=polkitd", "--regid=polkitd", "--init-groups", "--"])
-            .arg(daemon_binary())
-            .arg("--actions-dir")
-            .arg(directory.join("actions"))
-            .arg("--image-rules-dir")
-            .arg(directory.join("image"))
-            .arg("--local-rules-dir")
-            .arg(directory.join("local"))
-            .env("DBUS_SYSTEM_BUS_ADDRESS", &address)
-            .stderr(log)
-            .spawn()
-            .expect("setpriv");
-        let names = futures_lite::future::block_on(zbus::fdo::DBusProxy::new(&client)).unwrap();
-        wait_until("nyra-polkitd on the bus", || {
-            assert!(daemon.try_wait().unwrap().is_none(), "nyra-polkitd exited");
-            let name = "org.freedesktop.PolicyKit1".try_into().unwrap();
-            futures_lite::future::block_on(names.name_has_owner(name)).unwrap()
-        });
-        Self {
-            directory,
-            address,
-            bus,
-            daemon,
-            _logind: logind,
-            client,
-        }
-    }
-
-    /// Runs `program` (a pkcheck) on the test bus, as `user` or as root, in a new session of the
-    /// kernel's (setsid), without a controlling terminal, as a service runs it, so Debian's
-    /// pkcheck never prompts on the terminal of whoever runs the tests. With `cgroup`, pkcheck
-    /// starts in it. `timeout` gives it [`TIMEOUT`]: a pkcheck that hangs fails the test.
-    fn run(
-        &self,
-        user: Option<&str>,
-        cgroup: Option<&Path>,
-        program: &str,
-        args: &[&str],
-    ) -> Output {
-        let mut command = Command::new("sh");
-        // Moves itself into the cgroup (if any), then becomes the client.
-        command.args([
-            "-c",
-            r#"[ -z "$0" ] || echo $$ > "$0/cgroup.procs" || exit 99; exec "$@""#,
-        ]);
-        command.arg(cgroup.map(Path::as_os_str).unwrap_or_default());
-        command.arg("setpriv");
-        match user {
-            Some(user) => command.args([
-                &format!("--reuid={user}"),
-                "--regid=nogroup",
-                "--clear-groups",
-            ]),
-            None => command.arg("--reuid=0"),
-        };
-        command
-            .args(["--", "setsid", "--wait", "timeout"])
-            .arg(TIMEOUT.as_secs().to_string())
-            .arg(program)
-            .args(args)
-            .env("DBUS_SYSTEM_BUS_ADDRESS", &self.address)
-            .stdin(Stdio::null())
-            .output()
-            .expect("sh")
-    }
+/// The shared harness with this file's own fake logind on the bus: the harness, and the
+/// connection serving the logind (kept alive for the length of the test).
+fn start(test: &str) -> (Harness, Connection) {
+    futures_lite::future::block_on(Harness::start(
+        test,
+        &[
+            ("actions/test.policy", ACTIONS),
+            ("image/50-test.toml", RULES),
+        ],
+        "",
+        false,
+        FakeManager,
+        &daemon_binary(),
+    ))
 }
 
 /// What the diagnostics of both must have in common.
@@ -440,7 +269,7 @@ const NOBODY: u32 = 65534;
 #[ignore = "needs root, dbus-daemon and Debian's pkcheck: run by the integration job"]
 fn the_same_answers_as_debians_pkcheck() {
     use Stderr::*;
-    let bus = Harness::start("answers");
+    let (bus, _logind) = start("answers");
     let root = Sleeper::start(None);
     let nobody = Sleeper::start(Some("nobody"));
     let pid = root.pid();
@@ -545,7 +374,7 @@ fn the_same_answers_as_debians_pkcheck() {
 #[ignore = "needs root, dbus-daemon and Debian's pkcheck: run by the integration job"]
 fn the_same_refusals_of_malformed_options() {
     use Stderr::*;
-    let bus = Harness::start("malformed");
+    let (bus, _logind) = start("malformed");
     let root = |args: &[&str], stderr: Stderr| same(&bus, None, None, args, 126, stderr);
     root(&[], Same);
     root(&["--action-id"], Same);
@@ -583,7 +412,7 @@ fn the_same_refusals_of_malformed_options() {
 #[test]
 #[ignore = "needs root, dbus-daemon and Debian's pkcheck: run by the integration job"]
 fn where_ours_refuses_and_debians_guesses() {
-    let bus = Harness::start("refuses");
+    let (bus, _logind) = start("refuses");
     let root = Sleeper::start(None);
     let pid = root.pid();
     // Debian's pkcheck reads these as best it can (and fails later, or asks about pid 1); ours
@@ -641,7 +470,7 @@ fn where_ours_refuses_and_debians_guesses() {
 #[ignore = "needs root, dbus-daemon, Debian's pkcheck and a writable /sys/fs/cgroup: run by the integration job"]
 fn temporary_authorizations_of_the_session() {
     use Stderr::*;
-    let bus = Harness::start("temporary");
+    let (bus, _logind) = start("temporary");
     // Outside any session: both refuse before calling the authority.
     for option in ["--list-temp", "--revoke-temp"] {
         same(&bus, None, None, &[option], 1, SameButNumbers);
