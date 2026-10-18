@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+[package]
+name = "nyra-pkcheck"
+version = "0.1.0"
+edition = "2024"
+# The Rust in Debian 13 (trixie), as for the daemon.
+rust-version = "1.85"
+license = "MIT"
+publish = false
+description = "pkcheck(1) for nyra-polkit, written from scratch"
+
+# Installed as pkcheck: scripts and services call it by that name.
+[[bin]]
+name = "pkcheck"
+path = "src/main.rs"
+
+# Every dependency is a choice (docs/DESIGN.md, "Dependencies"); prefer none. The options are
+# parsed by hand: a dozen fixed options, and pkcheck's own syntax (`--detail KEY VALUE`, no
+# `--option=value`) that option parsers do not offer.
+[dependencies]
+# The daemon's library, for its `Process`: pkcheck pins the process it asks about with a pidfd and
+# reads its start time and uid exactly as the daemon does. No crate added.
+nyra-polkitd = { path = "../nyra-polkitd" }
+# The calls to org.freedesktop.PolicyKit1, as in the daemon (same version and features).
+zbus = { version = "5.13.2", default-features = false, features = ["async-io"] }
+# block_on for main; already in zbus's dependency tree.
+futures-lite = { version = "2.6.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The integration tests' fake logind and timeouts, and creating rule files owned by root; already
+# in the dependency tree.
+async-io = "2.6.0"
+nix = { version = "0.31.3", default-features = false, features = ["user"] }
