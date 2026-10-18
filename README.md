@@ -103,21 +103,58 @@ has a tarball per architecture, `nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz` and
 - `third-party/`: the licence files of every crate built into the binaries, and `CRATES`, their
   list with versions and licences.
 
-To verify a download, check it against `SHA256SUMS` from the same release, then check that it
-was built by this repository's release workflow (the
-[GitHub CLI](https://cli.github.com) checks the build provenance attestation):
+To check a download, first compare it with `SHA256SUMS` from the same release:
 
 ```sh
 sha256sum -c --ignore-missing SHA256SUMS
-gh attestation verify nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz -R NyraOS/nyra-polkit \
-  --signer-workflow NyraOS/nyra-polkit/.github/workflows/release.yml \
-  --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
 ```
 
-- `-R NyraOS/nyra-polkit`: the attestation was made in this repository;
-- `--signer-workflow`: by the release workflow, not by any other workflow or a pull request run;
-- `--source-ref`: from the release's tag, not from a branch;
-- `--deny-self-hosted-runners`: on a runner hosted by GitHub.
+Then check where it came from. Your trust should rest on the maintainer's signature on the tag,
+which no access token can make, and not only on the release workflow: anyone holding a token that
+can push tags could also run a changed workflow. From a clone of this repository, with `git`,
+`gpg`, `ssh-keygen` and the [GitHub CLI](https://cli.github.com) logged in:
+
+```sh
+git clone https://github.com/NyraOS/nyra-polkit && cd nyra-polkit
+tools/release/verify-download.sh ../nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz
+```
+
+It stops at the first check that fails:
+
+1. **The tag is signed by a maintainer.** It fetches the tag `vX.Y.Z` from GitHub and runs
+   `git verify-tag` with only the public signing keys that the logins in
+   [`.github/MAINTAINERS`](.github/MAINTAINERS) have registered on GitHub
+   ([`tools/release/verify-tag.sh`](tools/release/verify-tag.sh)). The tag must be annotated.
+2. **The tag's commit is on `main`'s history** (`git merge-base --is-ancestor <commit> main`).
+3. **The tarball was built by the release workflow, from that tag and that commit:**
+   ```sh
+   gh attestation verify nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz -R NyraOS/nyra-polkit \
+     --signer-workflow NyraOS/nyra-polkit/.github/workflows/release.yml \
+     --source-ref refs/tags/vX.Y.Z --source-digest <commit> --deny-self-hosted-runners
+   ```
+   - `-R NyraOS/nyra-polkit`: the attestation was made in this repository;
+   - `--signer-workflow`: by the release workflow, not by any other workflow or a pull request
+     run;
+   - `--source-ref`: from the release's tag, not from a branch;
+   - `--source-digest`: from the commit the signed tag points to;
+   - `--deny-self-hosted-runners`: on a runner hosted by GitHub.
+
+To check the signature by hand instead, take the maintainers' keys from GitHub (`MrTuNNe` is the
+login in `.github/MAINTAINERS` today) and verify the tag with them:
+
+```sh
+git fetch origin tag vX.Y.Z
+# GPG keys, in an empty keyring of their own so no other key counts:
+export GNUPGHOME=$(mktemp -d)
+gh api users/MrTuNNe/gpg_keys --jq '.[].raw_key' | gpg --import
+git verify-tag vX.Y.Z
+# or SSH keys:
+gh api users/MrTuNNe/ssh_signing_keys --jq '.[].key' | sed 's/^/MrTuNNe /' >allowed_signers
+git -c gpg.ssh.allowedSignersFile=allowed_signers verify-tag vX.Y.Z
+```
+
+`.github/MAINTAINERS` says whose signature you trust: a change to it is a change of trust, and
+its history shows who made it.
 
 ## Contributing
 

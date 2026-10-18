@@ -57,7 +57,11 @@ CI.
 Before it builds anything, the workflow ([`tools/release/verify-tag.sh`](tools/release/verify-tag.sh))
 refuses the tag unless it is annotated, points at the commit being built and is signed by one of
 the keys the maintainers have registered on GitHub, read from the GitHub API on every run; with no
-key registered, nothing is released. It also refuses a tag whose commit is not on `main`'s history
+key registered, nothing is released. The signature is also what users check
+([`tools/release/verify-download.sh`](tools/release/verify-download.sh), README "Releases"): the
+workflow runs as written in the tagged commit, so anyone holding a token that can push tags could
+run a changed one, but no token can make a maintainer's signature. That is why a tag is signed only
+with a key that never leaves the maintainer. It also refuses a tag whose commit is not on `main`'s history
 or whose version differs from the crates' version. The release notes list the pull requests
 merged since the previous release. A tag is never moved or reused: a broken release is fixed by
 the next version.

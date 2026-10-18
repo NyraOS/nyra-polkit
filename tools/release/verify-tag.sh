@@ -4,7 +4,7 @@
 # key that a maintainer in .github/MAINTAINERS has registered in their GitHub account. The keys
 # come from the GitHub API on every run and are the only ones trusted: whatever can push a tag
 # cannot make a release without a maintainer's key. Run it from the top of the repository, with
-# the tag object fetched and GH_TOKEN set for `gh api`.
+# the tag object fetched and GH_TOKEN set, or the GitHub CLI logged in, for `gh api`.
 #
 #   tools/release/verify-tag.sh TAG COMMIT
 set -euo pipefail
