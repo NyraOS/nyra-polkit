@@ -18,6 +18,7 @@ use crate::subject::Identified;
 use crate::temporary::{TemporaryAuthorizations, boot_clock};
 use crate::{Authorization, subject};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -36,15 +37,17 @@ const ALLOW_USER_INTERACTION: u32 = 1;
 /// Checks one connection may have in flight (docs/DESIGN.md, "Security").
 const MAX_CHECKS_PER_CONNECTION: usize = 32;
 /// Checks one user other than root may have in flight over all their connections. A user may open
-/// many connections, and every check may wait on logind, while the bus limits the replies the
-/// daemon can wait for (128 by default): one user alone must not fill them and lock out everyone
-/// else. Root is not counted: see [`ChecksInFlight::begin_for_user`].
-const MAX_CHECKS_PER_USER: usize = 64;
+/// many connections, and every check may wait on logind: the connection limit alone does not bound
+/// what one user makes the daemon hold. Root is not counted: see
+/// [`ChecksInFlight::begin_for_user`].
+const MAX_CHECKS_PER_USER: usize = 128;
 /// Authentications one user may have waiting for an agent or in a dialog, whoever asked for them.
 /// They wait as long as the user's agent wants, so they do not count in the caller's connection:
 /// a system service asks for every user on one connection, and one user must not fill it. Beyond
 /// the limit the answer is the challenge, without a dialog.
 const MAX_AUTHENTICATIONS_PER_USER: usize = 16;
+/// A user's refusals over a limit are logged at most this often.
+const LIMIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 /// What a caller is told when its subject cannot be identified. The reason goes to the journal
 /// only: it may name another user's process or uid.
 const SUBJECT_NOT_IDENTIFIED: &str = "cannot identify the subject";
@@ -435,6 +438,27 @@ impl BrokenRulesLog {
     }
 }
 
+/// Says when to log that a user was refused over a limit: at most once per
+/// [`LIMIT_LOG_INTERVAL`] and user, so a user hitting the limit cannot fill the journal.
+#[derive(Default)]
+struct LimitLog {
+    last: HashMap<u32, Instant>,
+}
+
+impl LimitLog {
+    fn due(&mut self, uid: u32, now: Instant) -> bool {
+        self.last
+            .retain(|_, last| now.duration_since(*last) < LIMIT_LOG_INTERVAL);
+        match self.last.entry(uid) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(now);
+                true
+            }
+        }
+    }
+}
+
 /// A mutex poisoned by a panic still holds consistent data here: every critical section is a
 /// few map or counter updates.
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -474,6 +498,8 @@ pub struct Authority {
     policy: RwLock<Policy>,
     checks: Mutex<ChecksInFlight>,
     broken_rules_log: Mutex<BrokenRulesLog>,
+    check_limit_log: Mutex<LimitLog>,
+    agent_limit_log: Mutex<LimitLog>,
     agents: Mutex<Agents>,
     cookies: Mutex<Cookies>,
     temporary: Mutex<TemporaryAuthorizations>,
@@ -485,6 +511,8 @@ impl Authority {
             policy: RwLock::new(policy),
             checks: Mutex::default(),
             broken_rules_log: Mutex::default(),
+            check_limit_log: Mutex::default(),
+            agent_limit_log: Mutex::default(),
             agents: Mutex::default(),
             cookies: Mutex::default(),
             temporary: Mutex::default(),
@@ -550,7 +578,13 @@ impl Authority {
                 eprintln!("<4>check from {caller}: {error}");
                 Error::Failed("cannot identify the caller".to_string())
             })?;
-        lock(&self.checks).begin_for_user(caller_uid)?;
+        lock(&self.checks)
+            .begin_for_user(caller_uid)
+            .inspect_err(|error| {
+                if lock(&self.check_limit_log).due(caller_uid, Instant::now()) {
+                    eprintln!("<4>check from {caller}, user {caller_uid} refused: {error:?}");
+                }
+            })?;
         let _user_in_flight = UserInFlight {
             checks: &self.checks,
             uid: caller_uid,
@@ -903,7 +937,12 @@ impl Authority {
         };
         lock(&self.agents)
             .register(agent.clone())
-            .map_err(Error::Failed)?;
+            .map_err(|reason| {
+                if lock(&self.agent_limit_log).due(caller_uid, Instant::now()) {
+                    eprintln!("<4>agent of {caller}, user {caller_uid} refused: {reason}");
+                }
+                Error::Failed(reason)
+            })?;
         // The caller may have left while it was identified, and its leaving then found no agent to
         // remove. Asked after the agent was added: if the caller is still there, its leaving comes
         // later and removes it.
@@ -1353,7 +1392,7 @@ mod tests {
     #[test]
     fn checks_in_flight_are_capped_per_user() {
         let mut checks = ChecksInFlight::default();
-        for _ in 0..64 {
+        for _ in 0..128 {
             assert!(checks.begin_for_user(1000).is_ok());
         }
         assert!(matches!(checks.begin_for_user(1000), Err(Error::Failed(_))));
@@ -1364,7 +1403,7 @@ mod tests {
         }
         checks.end_for_user(1000);
         assert!(checks.begin_for_user(1000).is_ok());
-        for _ in 0..64 {
+        for _ in 0..128 {
             checks.end_for_user(1000);
         }
         checks.end_for_user(1001);
@@ -1484,6 +1523,18 @@ mod tests {
         assert_eq!(log.denied(start + Duration::from_secs(60)), Some(3));
         assert_eq!(log.denied(start + Duration::from_secs(61)), None);
         assert_eq!(log.denied(start + Duration::from_secs(200)), Some(2));
+    }
+
+    #[test]
+    fn limit_refusals_are_logged_once_per_user_every_ten_seconds() {
+        let mut log = LimitLog::default();
+        let start = Instant::now();
+        assert!(log.due(1000, start));
+        assert!(!log.due(1000, start + Duration::from_secs(9)));
+        assert!(log.due(1001, start + Duration::from_secs(9)));
+        assert!(log.due(1000, start + Duration::from_secs(10)));
+        assert!(!log.due(1001, start + Duration::from_secs(10)));
+        assert!(log.due(1001, start + Duration::from_secs(19)));
     }
 
     /// A directory tree of mode 755 that the test user owns, standing in for root's.
