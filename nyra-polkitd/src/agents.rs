@@ -10,6 +10,7 @@
 
 use crate::subject::{Identified, SubjectKey};
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::sync::Arc;
 use zbus::Connection;
 use zbus::proxy::CacheProperties;
@@ -191,7 +192,11 @@ fn new_cookie() -> Result<String, String> {
             rustix::rand::getrandom(&mut bytes[filled..], rustix::rand::GetRandomFlags::empty())
                 .map_err(|error| format!("getrandom: {error}"))?;
     }
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut cookie = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(cookie, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(cookie)
 }
 
 /// The uid of a `unix-user` identity, `(sa{sv})` with `uid` a `u`; `None` for anything else.
