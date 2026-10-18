@@ -37,10 +37,10 @@ const ALLOW_USER_INTERACTION: u32 = 1;
 /// Checks one connection may have in flight (docs/DESIGN.md, "Security").
 const MAX_CHECKS_PER_CONNECTION: usize = 32;
 /// Checks one user other than root may have in flight over all their connections. A user may open
-/// many connections, and every check may wait on logind: the connection limit alone does not bound
-/// what one user makes the daemon hold. Root is not counted: see
-/// [`ChecksInFlight::begin_for_user`].
-const MAX_CHECKS_PER_USER: usize = 128;
+/// many connections, and every check may wait on logind, while the bus limits the replies the
+/// daemon can wait for (128 by default): one user alone must not fill them and lock out everyone
+/// else. Root is not counted: see [`ChecksInFlight::begin_for_user`].
+const MAX_CHECKS_PER_USER: usize = 64;
 /// Authentications one user may have waiting for an agent or in a dialog, whoever asked for them.
 /// They wait as long as the user's agent wants, so they do not count in the caller's connection:
 /// a system service asks for every user on one connection, and one user must not fill it. Beyond
@@ -1392,7 +1392,7 @@ mod tests {
     #[test]
     fn checks_in_flight_are_capped_per_user() {
         let mut checks = ChecksInFlight::default();
-        for _ in 0..128 {
+        for _ in 0..64 {
             assert!(checks.begin_for_user(1000).is_ok());
         }
         assert!(matches!(checks.begin_for_user(1000), Err(Error::Failed(_))));
@@ -1403,7 +1403,7 @@ mod tests {
         }
         checks.end_for_user(1000);
         assert!(checks.begin_for_user(1000).is_ok());
-        for _ in 0..128 {
+        for _ in 0..64 {
             checks.end_for_user(1000);
         }
         checks.end_for_user(1001);

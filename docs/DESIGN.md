@@ -496,7 +496,7 @@ Threat model:
 | a remote user (SSH) | use their processes left in another user's local session (`su`, `sudo -u` at the seat) | a session of another user is not local, except for root |
 | a local user | write rules | rule files and directories must be root's and not writable by others |
 | a sandboxed app | act as more than its user | it is identified like any other client of the system bus, by the bus |
-| anyone | exhaust the daemon | at most 32 checks in flight per connection and 128 per user other than root (the callers' uid), and 16 agents per user, root included; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
+| anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user other than root (the callers' uid), and 16 agents per user, root included; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
 | a local user | fill a system service's connection with dialogs that never close, so its checks for everyone else fail | checks waiting for an agent leave the connection's 32 and count per subject user (at most 16); beyond that, the challenge without a dialog |
 | an administrator's change | be undone by a dialog opened before it | an authentication that started under rules since reread is not authorized and keeps nothing |
 | a broken or hostile action file | crash or bloat the daemon | parse errors skip the file (its actions stay unknown, so denied); no external DTD or entity loading; node and size limits |
@@ -518,8 +518,8 @@ which is all it needs. It never runs code from rules and never calls out to the 
 
 **Limits.** A user can open many connections to the bus (dbus-daemon allows 256 per user), and every
 check may wait on logind, while the bus limits the replies the daemon itself may be waiting for (128
-by default). So besides the 32 checks per connection, one user (the callers' uid) has at most 128
-checks in flight over all their connections, which bounds what one user makes the daemon hold. Checks
+by default). So besides the 32 checks per connection, one user (the callers' uid) has at most 64
+checks in flight over all their connections, and no user alone can fill the daemon's replies. Checks
 waiting for an agent are counted apart, per subject user (see "Authentication"), so the dialogs of
 one user cannot fill a service's connection either. Root is not counted: root's callers are the
 system services (logind, NetworkManager, udisks2...), and a user can make them ask on the user's
