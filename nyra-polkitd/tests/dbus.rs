@@ -743,7 +743,14 @@ impl Sleeper {
                 "--clear-groups",
             ]);
         }
-        Self(command.args(["--", "sleep", "600"]).spawn().unwrap())
+        let child = command.args(["--", "sleep", "600"]).spawn().unwrap();
+        // Until setpriv has changed users and run sleep, the process is still root's setpriv: a
+        // check of it then would be about root.
+        let comm = format!("/proc/{}/comm", child.id());
+        wait_until("the sleeper", || {
+            std::fs::read_to_string(&comm).is_ok_and(|name| name == "sleep\n")
+        });
+        Self(child)
     }
 
     fn pid(&self) -> u32 {
