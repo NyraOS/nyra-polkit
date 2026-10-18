@@ -8,10 +8,11 @@
 //! directory that anyone but root could have written is such an error, as for sudoers.
 
 use crate::{Authorization, is_valid_action_id, read_opened_file};
+use rustix::fs::OFlags;
 use serde::Deserialize;
 use std::collections::BTreeMap;
-use std::fs::{File, Metadata};
-use std::os::unix::fs::MetadataExt;
+use std::fs::{Metadata, OpenOptions};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 /// The rules that come with the image (read-only, verified with it).
@@ -67,6 +68,9 @@ pub enum SessionCondition {
     Local,
     Active,
 }
+
+/// The rules, the notes and the warnings to log of a load.
+pub type Loaded = (Rules, Vec<String>, Vec<String>);
 
 /// All the rules in force.
 #[derive(Debug, Clone, PartialEq)]
@@ -127,18 +131,15 @@ fn check_rule(rule: &Rule) -> Result<(), String> {
 
 /// Loads the rules: every `*.toml` of both directories, a file in `local` replacing the file with
 /// the same name in `image`. A missing directory has no rules. The administrators of all files add
-/// up; without any, the administrator is root. Returns the rules and what to log about the files.
-pub fn load_rules(image: &Path, local: &Path) -> Result<(Rules, Vec<String>), String> {
+/// up; without any, the administrator is root. Returns the rules, what to log about the files, and
+/// the warnings to log.
+pub fn load_rules(image: &Path, local: &Path) -> Result<Loaded, String> {
     load_rules_owned_by(image, local, 0)
 }
 
 /// [`load_rules`], with the owner the directories and files must have: root (0), except in the
 /// tests, which cannot create files owned by root.
-fn load_rules_owned_by(
-    image: &Path,
-    local: &Path,
-    owner: u32,
-) -> Result<(Rules, Vec<String>), String> {
+fn load_rules_owned_by(image: &Path, local: &Path, owner: u32) -> Result<Loaded, String> {
     let mut files: BTreeMap<String, PathBuf> = rule_files(image, owner)?.into_iter().collect();
     let mut replaced: BTreeMap<String, PathBuf> = BTreeMap::new();
     for (name, path) in rule_files(local, owner)? {
@@ -149,6 +150,7 @@ fn load_rules_owned_by(
 
     let mut parsed = Vec::new();
     let mut notes = Vec::new();
+    let mut warnings = Vec::new();
     for (name, path) in &files {
         let text = read_trusted_file(path, owner)?;
         let file = parse_rule_file(&path.display().to_string(), &text)?;
@@ -160,9 +162,34 @@ fn load_rules_owned_by(
             Some(image_path) => format!("{} replaces {}", path.display(), image_path.display()),
             None => format!("read {}", path.display()),
         });
+        warnings.extend(broad_prefix_warnings(&path.display().to_string(), &file));
         parsed.push(file);
     }
-    Ok((combine(parsed), notes))
+    Ok((combine(parsed), notes, warnings))
+}
+
+/// A prefix such as `org.*` matches almost every action, so a rule that grants anything for it
+/// weakens them nearly as much as `*`, which is refused. It is allowed but logged.
+fn broad_prefix_warnings(path: &str, file: &RuleFile) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for rule in file
+        .rules
+        .iter()
+        .filter(|rule| rule.result != Authorization::No)
+    {
+        for pattern in &rule.actions {
+            let is_broad = pattern
+                .strip_suffix(".*")
+                .is_some_and(|prefix| prefix.split('.').count() < 2);
+            if is_broad {
+                warnings.push(format!(
+                    "{path}: the rule for {pattern:?} grants more than \"no\" to a very broad \
+                     set of actions"
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 fn combine(files: Vec<RuleFile>) -> Rules {
@@ -201,6 +228,12 @@ fn rule_files(directory: &Path, owner: u32) -> Result<Vec<(String, PathBuf)>, St
         return Err(format!("{}: not a directory", directory.display()));
     }
     check_owner_and_mode(&metadata, directory, owner)?;
+    // Otherwise whoever can write the parent could swap the directory for another one of root's.
+    if let Some(parent) = directory.parent() {
+        let metadata =
+            std::fs::metadata(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+        check_owner_and_mode(&metadata, parent, owner)?;
+    }
 
     let entries = std::fs::read_dir(directory)
         .map_err(|error| format!("{}: {error}", directory.display()))?;
@@ -222,12 +255,21 @@ fn rule_files(directory: &Path, owner: u32) -> Result<Vec<(String, PathBuf)>, St
 /// Opens a rule file and checks what was opened (fstat), so a symbolic link is judged by its
 /// target and the file cannot be swapped between the check and the read.
 fn read_trusted_file(path: &Path, owner: u32) -> Result<String, String> {
-    let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    // O_NONBLOCK: opening a FIFO would block until a writer comes, before the check below.
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlags::NONBLOCK | OFlags::CLOEXEC).bits() as i32)
+        .open(path)
+        .map_err(|error| format!("{}: {error}", path.display()))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("{}: {error}", path.display()))?;
     if !metadata.is_file() {
-        return Err(format!("{}: not a regular file", path.display()));
+        return Err(format!(
+            "{}: not a regular file (a link to /dev/null does not disable a file; to switch off \
+             a file of the image, put an empty file with the same name in {LOCAL_RULES_DIR})",
+            path.display()
+        ));
     }
     check_owner_and_mode(&metadata, path, owner)?;
     read_opened_file(file, path)
@@ -352,16 +394,23 @@ mod tests {
 
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    /// A new, empty directory, and the uid that owns it (the user running the tests), which stands
+    /// A new, empty `rules.d` in a new directory of its own (removed with [`remove`]), and the uid that owns it (the user running the tests), which stands
     /// for root here.
     fn temporary_directory(name: &str) -> (PathBuf, u32) {
-        let directory =
+        let parent =
             std::env::temp_dir().join(format!("nyra-polkit-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
+        let _ = std::fs::remove_dir_all(&parent);
+        let directory = parent.join("rules.d");
         std::fs::create_dir_all(&directory).unwrap();
-        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for path in [&parent, &directory] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         let owner = std::fs::metadata(&directory).unwrap().uid();
         (directory, owner)
+    }
+
+    fn remove(directory: &Path) {
+        std::fs::remove_dir_all(directory.parent().unwrap()).unwrap();
     }
 
     fn write(path: PathBuf, text: &str) {
@@ -391,7 +440,7 @@ mod tests {
             "administrators = { users = [\"alice\"] }\n",
         );
 
-        let (rules, notes) = load_rules_owned_by(&image, &local, owner).unwrap();
+        let (rules, notes, _) = load_rules_owned_by(&image, &local, owner).unwrap();
         assert_eq!(rules.rules.len(), 1);
         assert_eq!(rules.rules[0].actions, ["b"]);
         assert_eq!(rules.administrators.groups, ["sudo"]);
@@ -416,8 +465,8 @@ mod tests {
         let error = load_rules_owned_by(&image, &local, owner).unwrap_err();
         assert!(error.contains("90-broken.toml"), "{error}");
 
-        std::fs::remove_dir_all(&image).unwrap();
-        std::fs::remove_dir_all(&local).unwrap();
+        remove(&image);
+        remove(&local);
     }
 
     #[test]
@@ -453,7 +502,7 @@ mod tests {
         );
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        std::fs::remove_dir_all(&directory).unwrap();
+        remove(&directory);
     }
 
     #[test]
@@ -466,7 +515,7 @@ mod tests {
             "[[rule]]\nactions = [\"a\"]\nresult = \"no\"\n",
         );
         symlink(target.join("rules"), directory.join("50-a.toml")).unwrap();
-        let (rules, _) = load_rules_owned_by(&directory, &missing, owner).unwrap();
+        let (rules, _, _) = load_rules_owned_by(&directory, &missing, owner).unwrap();
         assert_eq!(rules.rules.len(), 1);
 
         std::fs::set_permissions(target.join("rules"), std::fs::Permissions::from_mode(0o666))
@@ -479,8 +528,75 @@ mod tests {
         let error = load_rules_owned_by(&directory, &missing, owner).unwrap_err();
         assert!(error.contains("not a regular file"), "{error}");
 
-        std::fs::remove_dir_all(&directory).unwrap();
-        std::fs::remove_dir_all(&target).unwrap();
+        remove(&directory);
+        remove(&target);
+    }
+
+    #[test]
+    fn links_to_dev_null_say_how_to_disable_a_file() {
+        let (directory, owner) = temporary_directory("dev-null");
+        let missing = directory.join("none");
+        symlink("/dev/null", directory.join("50-a.toml")).unwrap();
+        let error = load_rules_owned_by(&directory, &missing, owner).unwrap_err();
+        assert!(
+            error.contains("not a regular file") && error.contains("an empty file"),
+            "{error}"
+        );
+        remove(&directory);
+    }
+
+    #[test]
+    fn a_fifo_is_refused_instead_of_blocking() {
+        let (directory, owner) = temporary_directory("fifo");
+        let missing = directory.join("none");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            directory.join("50-a.toml"),
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        // Run on another thread: a regression would block forever instead of failing.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let path = directory.clone();
+        std::thread::spawn(move || {
+            let _ = sender.send(load_rules_owned_by(&path, &missing, owner));
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("opening a FIFO blocked");
+        assert!(result.unwrap_err().contains("not a regular file"));
+        remove(&directory);
+    }
+
+    #[test]
+    fn the_directory_holding_rules_d_must_be_trusted_too() {
+        let (directory, owner) = temporary_directory("parent");
+        let missing = directory.join("none");
+        let parent = directory.parent().unwrap();
+        for mode in [0o775, 0o757] {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(mode)).unwrap();
+            let error = load_rules_owned_by(&directory, &missing, owner).unwrap_err();
+            assert!(
+                error.contains(&parent.display().to_string()) && error.contains("not writable"),
+                "{error}"
+            );
+        }
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(load_rules_owned_by(&directory, &missing, owner).is_ok());
+        remove(&directory);
+    }
+
+    #[test]
+    fn broad_prefixes_that_grant_something_are_warned_about() {
+        let warnings = |actions: &str, result: &str| {
+            let text = format!("[[rule]]\nactions = {actions}\nresult = \"{result}\"\n");
+            broad_prefix_warnings("f", &parse_rule_file("f", &text).unwrap())
+        };
+        assert_eq!(warnings("[\"org.*\", \"io.*\"]", "auth_admin").len(), 2);
+        assert!(warnings("[\"org.*\"]", "no").is_empty());
+        assert!(warnings("[\"org.example.*\", \"org.a\"]", "yes").is_empty());
     }
 
     #[test]
@@ -493,7 +609,7 @@ mod tests {
             "[[rule]]\nactions = [\"a\"]\nresult = \"no\"\n",
         );
         write(directory.join(".#50-a.toml"), "not toml at all");
-        let (rules, notes) = load_rules_owned_by(&directory, &missing, owner).unwrap();
+        let (rules, notes, _) = load_rules_owned_by(&directory, &missing, owner).unwrap();
         assert_eq!(rules.rules.len(), 1);
         assert_eq!(
             notes,
@@ -505,13 +621,13 @@ mod tests {
         let error = load_rules_owned_by(&directory, &missing, owner).unwrap_err();
         assert!(error.contains("not UTF-8"), "{error}");
 
-        std::fs::remove_dir_all(&directory).unwrap();
+        remove(&directory);
     }
 
     #[test]
     fn no_files_means_root_is_the_administrator() {
         let missing = std::env::temp_dir().join("nyra-polkit-does-not-exist");
-        let (rules, notes) = load_rules(&missing, &missing).unwrap();
+        let (rules, notes, _) = load_rules(&missing, &missing).unwrap();
         assert!(rules.rules.is_empty() && notes.is_empty());
         assert_eq!(rules.administrators.users, ["root"]);
         assert!(rules.administrators.groups.is_empty());

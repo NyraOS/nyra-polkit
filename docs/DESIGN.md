@@ -170,7 +170,9 @@ written by listing what is denied). Rules have no negation in the first version.
 Rules replace the default; they do not add to it. A rule that says `auth_admin` for an action whose
 default is `no` makes that action possible with a password. That is why `actions = ["*"]` is only
 allowed with `result = "no"`: a wildcard that grants anything would loosen every action whose
-default is `no`, including the ones installed later.
+default is `no`, including the ones installed later. A short prefix such as `org.*` or `io.*`
+(fewer than two parts before the `*`) with any result other than `no` weakens almost as much; it
+is allowed, but a warning is logged each time the rules are loaded.
 
 Unknown actions are denied before any rule is looked at, so no rule can grant an action that no
 installed program defines. An action id defined in two action files is unknown too: which
@@ -185,11 +187,19 @@ in `/etc/nyra-polkit/rules.d/*.toml`. A file in `/etc` replaces the image file w
 a file there without rules (empty, or only comments) switches the image's file off. Both are logged.
 All other files apply together; their order does not matter.
 
-**Only root can write rules.** Both directories and every rule file must be owned by root and not
-writable by group or others, and every rule file must be a regular file. Files are checked on the
-opened file (fstat), so a symbolic link is judged by its target and a link to `/dev/null` is not a
-rule file. Anything else is a rule error, as sudo does for sudoers. So is a file name that is not
-UTF-8; names starting with `.` (editor leftovers such as `.#50-local.toml`) are ignored.
+**Only root can write rules.** Both `rules.d` directories, the directories that contain them
+(`/usr/share/nyra-polkit`, `/etc/nyra-polkit`; otherwise `rules.d` could be swapped for another
+directory of root's) and every rule file must be owned by root and not writable by group or others,
+and every rule file must be a regular file. Files are opened with `O_NONBLOCK`, so a FIFO is
+refused instead of blocking the daemon, and checked on the opened file (fstat), so a symbolic link
+is judged by its target. Anything else is a rule error, as sudo does for sudoers. So is a file
+name that is not UTF-8; names starting with `.` (editor leftovers such as `.#50-local.toml`) are
+ignored.
+
+**A link to `/dev/null` does not disable a file.** It is the way systemd disables a unit, but here
+its target is not a regular file, so it is a rule error and every request fails closed. That is
+safe, only surprising. To switch off a file of the image, put an empty file (or one with only
+comments) with the same name in `/etc/nyra-polkit/rules.d`; the error message says so.
 
 A file may have an `[administrators]` table (`users`, `groups`) and any number of `[[rule]]`
 tables. The administrators of all files add up; without any, root is the administrator.

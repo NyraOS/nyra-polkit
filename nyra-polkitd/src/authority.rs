@@ -130,7 +130,10 @@ pub fn load_policy(directories: &Directories) -> Policy {
     }
     let rules = load_rules(&directories.image_rules, &directories.local_rules);
     match &rules {
-        Ok((rules, notes)) => {
+        Ok((rules, notes, warnings)) => {
+            for warning in warnings {
+                eprintln!("<4>{warning}");
+            }
             for note in notes {
                 eprintln!("<6>{note}");
             }
@@ -146,7 +149,7 @@ pub fn load_policy(directories: &Directories) -> Policy {
     }
     Policy {
         actions,
-        rules: rules.map(|(rules, _)| rules),
+        rules: rules.map(|(rules, _, _)| rules),
         generation: 0,
     }
 }
