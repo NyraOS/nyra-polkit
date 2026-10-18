@@ -30,3 +30,26 @@ nyra-polkit decides who may do what on a Nyra OS machine, so the rules are stric
   (`MIT`, the licence of this repository); contributions are accepted under it.
 - Before you push, run what CI runs: `cargo fmt --check`,
   `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked`.
+
+## Releases
+
+Versions follow [SemVer](https://semver.org), starting at 0.1.0. A release is a signed tag
+`vX.Y.Z` on `main`, pushed by a maintainer; the [release workflow](.github/workflows/release.yml)
+builds, attests and publishes it. Nothing else creates tags or releases.
+
+1. In a pull request, set the new version in `nyra-polkitd/Cargo.toml` and
+   `nyra-pkcheck/Cargo.toml`, run `cargo update --workspace` so `Cargo.lock` follows, and merge it.
+2. Tag the merged commit with a signed, annotated tag and push the tag:
+   ```sh
+   git fetch origin
+   git tag -s v0.1.0 -m "nyra-polkit 0.1.0" origin/main
+   git tag -v v0.1.0
+   git push origin v0.1.0
+   ```
+   `-s` signs with your GPG key (or your SSH key, with `gpg.format=ssh`), which must be added to
+   your GitHub account as a signing key so GitHub shows the tag as verified.
+
+The workflow cannot check the signature itself (it holds no maintainer keys), but it refuses a tag
+whose commit is not on `main`'s history or whose version differs from the crates' version. The
+release notes list the pull requests merged since the previous release. A tag is never moved or
+reused: a broken release is fixed by the next version.

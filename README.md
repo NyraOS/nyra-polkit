@@ -88,6 +88,30 @@ cargo test --test dbus --test compat -- --ignored
 
 Rust 1.85 or newer (the version in Debian 13).
 
+## Releases
+
+Releases follow [SemVer](https://semver.org) and are published on
+[GitHub Releases](https://github.com/NyraOS/nyra-polkit/releases), built by the
+[release workflow](.github/workflows/release.yml) from a signed `vX.Y.Z` tag on `main`. Each one
+has a tarball per architecture, `nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz` and
+`nyra-polkit-X.Y.Z-aarch64-linux-gnu.tar.gz` (Linux, glibc), with:
+
+- `bin/nyra-polkitd` and `bin/pkcheck`;
+- `dist/`: the systemd unit, the D-Bus policy and activation file and the sysusers file, each
+  naming where it is installed in its first lines;
+- `LICENSE`, `README.md`, `SECURITY.md`;
+- `third-party/`: the licence files of every crate built into the binaries, and `CRATES`, their
+  list with versions and licences.
+
+To verify a download, check it against `SHA256SUMS` from the same release, then check that it
+was built by this repository's release workflow (the
+[GitHub CLI](https://cli.github.com) checks the build provenance attestation):
+
+```sh
+sha256sum -c --ignore-missing SHA256SUMS
+gh attestation verify nyra-polkit-X.Y.Z-x86_64-linux-gnu.tar.gz -R NyraOS/nyra-polkit
+```
+
 ## Contributing
 
 Every change goes through a pull request. nyra-polkit is written only from documented interfaces
