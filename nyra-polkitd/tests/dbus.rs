@@ -20,17 +20,22 @@
 //!
 //! Every wait has a timeout, so a regression fails the test instead of hanging the job.
 
+// The harness shared with nyra-pkcheck's tests/compat.rs: one file, included with `#[path]`
+// from both crates' tests (why not a crate of its own: see the top of the file).
+#[path = "../../tests/common/harness.rs"]
+mod harness;
+
 use futures_lite::StreamExt;
+use harness::{TIMEOUT, connect, wait_until, write_trusted};
 use nyra_polkitd::process::Process;
 use std::collections::HashMap;
-use std::fs::{File, Permissions};
+use std::fs::File;
 use std::io::{BufRead, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use zbus::fdo::DBusProxy;
 use zbus::message::Type as MessageType;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, MatchRule, MessageStream, interface};
@@ -195,10 +200,6 @@ const PKCHECK_AUTHORIZED: i32 = 0;
 const PKCHECK_NOT_AUTHORIZED: i32 = 1;
 const PKCHECK_CHALLENGE: i32 = 2;
 
-/// How long any wait of the tests may take. Longer than the daemon's own timeout on logind (10 s),
-/// so that one is seen; short enough that a hang fails well before the job's timeout.
-const TIMEOUT: Duration = Duration::from_secs(30);
-
 // --- The fake logind ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -349,52 +350,24 @@ impl FakeUserObject {
 
 // --- The harness -------------------------------------------------------------------------------
 
-/// A private bus with nyra-polkitd, the fake logind and a client on it.
+/// The shared harness (tests/common/harness.rs), with these tests' own fake logind on the bus:
+/// the connection serving it and its state, so a test can place any process in any session.
 struct Harness {
-    directory: PathBuf,
-    address: String,
-    bus: Child,
-    daemon: Child,
+    shared: harness::Harness,
     logind: Connection,
     logind_state: Arc<Mutex<LogindState>>,
-    client: Connection,
-    /// The bus also listens at [`SYSTEM_BUS_SOCKET`].
-    system_socket: bool,
 }
 
-impl Drop for Harness {
-    fn drop(&mut self) {
-        let _ = self.daemon.kill();
-        let _ = self.daemon.wait();
-        let _ = self.bus.kill();
-        let _ = self.bus.wait();
-        if self.system_socket {
-            let _ = std::fs::remove_file(SYSTEM_BUS_SOCKET);
-        }
-        if std::thread::panicking() {
-            eprintln!("--- nyra-polkitd log ---\n{}", self.log());
-        }
-        let _ = std::fs::remove_dir_all(&self.directory);
-    }
-}
-
-fn write_trusted(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, Permissions::from_mode(0o644)).unwrap();
-}
-
-fn make_directory(path: &Path) {
-    std::fs::create_dir_all(path).unwrap();
-    std::fs::set_permissions(path, Permissions::from_mode(0o755)).unwrap();
-}
-
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let deadline = Instant::now() + TIMEOUT;
-    while !done() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
+/// The bus policy these tests need beyond the shared one: the relay the fake agents pass their
+/// dialogs to, and monitoring of the bus.
+const BUS_POLICY: &str = r#"  <policy user="root">
+    <allow send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus.Monitoring"/>
+    <allow own="org.nyra.test.Relay"/>
+  </policy>
+  <policy context="default">
+    <allow send_destination="org.nyra.test.Relay"/>
+  </policy>
+"#;
 
 /// `future`, or a failed test once [`TIMEOUT`] has passed.
 async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
@@ -405,165 +378,37 @@ async fn within<T>(what: &str, future: impl Future<Output = T>) -> T {
     futures_lite::future::or(future, timeout).await
 }
 
-/// A client connection to the test bus, whose calls time out.
-async fn connect(address: &str) -> Connection {
-    zbus::connection::Builder::address(address)
-        .unwrap()
-        .method_timeout(TIMEOUT)
-        .build()
-        .await
-        .unwrap()
-}
-
 impl Harness {
     async fn start(test: &str, local_rules: &str) -> Self {
-        Self::start_listening(test, local_rules, false).await
+        Self::start_with(test, local_rules, false).await
     }
 
-    /// The same, with the bus also at the system bus's own address ([`SYSTEM_BUS_SOCKET`]), for
-    /// the setuid helper. Only one test may do that, and only where no system bus runs.
+    /// The same, with the bus also at the system bus's own address, for the setuid helper. Only
+    /// one test may do that, and only where no system bus runs.
     async fn start_on_system_socket(test: &str, local_rules: &str) -> Self {
-        assert!(
-            !Path::new(SYSTEM_BUS_SOCKET).exists(),
-            "{SYSTEM_BUS_SOCKET} exists: a system bus may run here, and the test needs its address"
-        );
-        make_directory(Path::new(SYSTEM_BUS_SOCKET).parent().unwrap());
-        Self::start_listening(test, local_rules, true).await
+        Self::start_with(test, local_rules, true).await
     }
 
-    async fn start_listening(test: &str, local_rules: &str, system_socket: bool) -> Self {
-        assert!(
-            nix::unistd::geteuid().is_root(),
-            "the D-Bus integration tests need root (see the top of tests/dbus.rs)"
-        );
-        let directory = std::env::temp_dir().join(format!("nyra-polkit-{test}"));
-        let _ = std::fs::remove_dir_all(&directory);
-        for sub in ["", "actions", "image", "local"] {
-            make_directory(&directory.join(sub));
-        }
-        write_trusted(&directory.join("actions/test.policy"), ACTIONS);
-        write_trusted(&directory.join("image/50-test.toml"), RULES);
-        write_trusted(&directory.join("local/90-local.toml"), local_rules);
-
-        let socket = directory.join("bus");
-        let policy = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../dist/org.freedesktop.PolicyKit1.conf")
-            .canonicalize()
-            .unwrap();
-        // The defaults of Debian's system bus (deny owning names and calling methods, unless
-        // allowed), the fake logind's name, and the daemon's own policy from dist/.
-        let config = format!(
-            r#"<busconfig>
-  <type>system</type>
-  <listen>unix:path={socket}</listen>
-  {system_listen}
-  <auth>EXTERNAL</auth>
-  <policy context="default">
-    <allow user="*"/>
-    <deny own="*"/>
-    <deny send_type="method_call"/>
-    <allow send_type="signal"/>
-    <allow send_requested_reply="true" send_type="method_return"/>
-    <allow send_requested_reply="true" send_type="error"/>
-    <allow receive_type="method_call"/>
-    <allow receive_type="method_return"/>
-    <allow receive_type="error"/>
-    <allow receive_type="signal"/>
-    <allow send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus"/>
-    <allow send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus.Properties"/>
-  </policy>
-  <policy user="root">
-    <allow send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus.Monitoring"/>
-    <allow own="org.freedesktop.login1"/>
-    <allow own="org.nyra.test.Relay"/>
-  </policy>
-  <policy context="default">
-    <allow send_destination="org.freedesktop.login1"/>
-    <allow send_destination="org.nyra.test.Relay"/>
-  </policy>
-  <include>{policy}</include>
-</busconfig>
-"#,
-            socket = socket.display(),
-            system_listen = match system_socket {
-                true => format!("<listen>unix:path={SYSTEM_BUS_SOCKET}</listen>"),
-                false => String::new(),
-            },
-            policy = policy.display()
-        );
-        write_trusted(&directory.join("bus.conf"), &config);
-        let bus = Command::new("dbus-daemon")
-            .arg(format!(
-                "--config-file={}",
-                directory.join("bus.conf").display()
-            ))
-            .args(["--nofork", "--nopidfile", "--nosyslog"])
-            .spawn()
-            .expect("dbus-daemon");
-        wait_until("the bus socket", || socket.exists());
-        let address = format!("unix:path={}", socket.display());
-
+    async fn start_with(test: &str, local_rules: &str, system_socket: bool) -> Self {
         let logind_state = Arc::new(Mutex::new(LogindState::default()));
-        let logind = zbus::connection::Builder::address(address.as_str())
-            .unwrap()
-            .serve_at("/org/freedesktop/login1", FakeManager(logind_state.clone()))
-            .unwrap()
-            .name("org.freedesktop.login1")
-            .unwrap()
-            .build()
-            .await
-            .unwrap();
-
-        let log = File::create(directory.join("daemon.log")).unwrap();
-        let daemon = Command::new("setpriv")
-            .args(["--reuid=polkitd", "--regid=polkitd", "--init-groups", "--"])
-            .arg(env!("CARGO_BIN_EXE_nyra-polkitd"))
-            .arg("--actions-dir")
-            .arg(directory.join("actions"))
-            .arg("--image-rules-dir")
-            .arg(directory.join("image"))
-            .arg("--local-rules-dir")
-            .arg(directory.join("local"))
-            .env("DBUS_SYSTEM_BUS_ADDRESS", &address)
-            .stderr(log)
-            .spawn()
-            .expect("setpriv");
-
-        let client = connect(&address).await;
-        let mut harness = Self {
-            directory,
-            address,
-            bus,
-            daemon,
+        let (shared, logind) = harness::Harness::start(
+            test,
+            &[
+                ("actions/test.policy", ACTIONS),
+                ("image/50-test.toml", RULES),
+                ("local/90-local.toml", local_rules),
+            ],
+            BUS_POLICY,
+            system_socket,
+            FakeManager(logind_state.clone()),
+            Path::new(env!("CARGO_BIN_EXE_nyra-polkitd")),
+        )
+        .await;
+        Self {
+            shared,
             logind,
             logind_state,
-            client,
-            system_socket,
-        };
-        let deadline = Instant::now() + TIMEOUT;
-        while !harness.name_is_owned().await {
-            assert!(
-                harness.daemon.try_wait().unwrap().is_none(),
-                "nyra-polkitd exited:\n{}",
-                harness.log()
-            );
-            assert!(Instant::now() < deadline, "nyra-polkitd never took {NAME}");
-            std::thread::sleep(Duration::from_millis(50));
         }
-        harness
-    }
-
-    fn log(&self) -> String {
-        std::fs::read_to_string(self.directory.join("daemon.log")).unwrap_or_default()
-    }
-
-    async fn name_is_owned(&self) -> bool {
-        DBusProxy::new(&self.client)
-            .await
-            .unwrap()
-            .name_has_owner(NAME.try_into().unwrap())
-            .await
-            .unwrap()
     }
 
     async fn add_session(&self, id: &str, session: FakeSession) {
@@ -597,7 +442,8 @@ impl Harness {
         flags: u32,
         cancellation_id: &str,
     ) -> zbus::Result<zbus::Message> {
-        self.client
+        self.shared
+            .client
             .call_method(
                 Some(NAME),
                 PATH,
@@ -655,39 +501,9 @@ impl Harness {
         self.add_session(id, session).await;
     }
 
-    /// Runs a client on the test bus, as `user` (a name or a uid) or as root.
-    fn run(&self, user: Option<&str>, program: &str, arguments: &[&str]) -> Output {
-        self.command(user, program, arguments)
-            .output()
-            .expect("setpriv")
-    }
-
-    /// A client on the test bus, as `user` or as root, given [`TIMEOUT`] by `timeout`: a client
-    /// that hangs fails the test (`timeout` exits with 124).
-    fn command(&self, user: Option<&str>, program: &str, arguments: &[&str]) -> Command {
-        let mut command = Command::new("setpriv");
-        match user {
-            Some(user) => command.args([
-                &format!("--reuid={user}"),
-                &format!(
-                    "--regid={}",
-                    if user == "nobody" { "nogroup" } else { user }
-                ),
-                "--clear-groups",
-            ]),
-            None => command.arg("--reuid=0"),
-        };
-        command
-            .args(["--", "timeout", &TIMEOUT.as_secs().to_string(), program])
-            .args(arguments)
-            .env("DBUS_SYSTEM_BUS_ADDRESS", &self.address)
-            .stdin(Stdio::null());
-        command
-    }
-
     /// Runs pkcheck as `user` or as root: see [`pkcheck_answer`].
     fn pkcheck_as(&self, user: Option<&str>, arguments: &[&str]) -> Result<i32, String> {
-        pkcheck_answer(self.run(user, "pkcheck", arguments))
+        pkcheck_answer(self.shared.run(user, None, "pkcheck", arguments))
     }
 
     fn pkcheck(&self, action: &str, process: &str) -> Result<i32, String> {
@@ -695,7 +511,8 @@ impl Harness {
     }
 
     async fn cancel(&self, cancellation_id: &str) -> Result<(), String> {
-        self.client
+        self.shared
+            .client
             .call_method(
                 Some(NAME),
                 PATH,
@@ -709,7 +526,7 @@ impl Harness {
     }
 
     fn reload(&self) {
-        let pid = rustix::process::Pid::from_raw(self.daemon.id() as i32).unwrap();
+        let pid = rustix::process::Pid::from_raw(self.shared.daemon.id() as i32).unwrap();
         rustix::process::kill_process(pid, rustix::process::Signal::HUP).unwrap();
     }
 }
@@ -917,7 +734,7 @@ fn root_is_authorized_for_every_known_action() {
         let bus = Harness::start("root-authorized", "").await;
         // No session for root's processes: the default is allow_any, "no" for DEFAULT.
         let root = Sleeper::start(None);
-        let own_name = bus.client.unique_name().unwrap().to_string();
+        let own_name = bus.shared.client.unique_name().unwrap().to_string();
         bus.add_session("c1", LOCAL_ACTIVE).await;
 
         // Subjects whose uid is known race-free: a process whose client sent the uid it saw, a bus
@@ -956,7 +773,10 @@ fn root_is_authorized_for_every_known_action() {
 
         // Even with rules that cannot be read.
         let mut changes = changed_signals(&bus).await;
-        write_trusted(&bus.directory.join("local/90-local.toml"), BROKEN_RULES);
+        write_trusted(
+            &bus.shared.directory.join("local/90-local.toml"),
+            BROKEN_RULES,
+        );
         bus.reload();
         within("Changed", changes.next()).await.unwrap().unwrap();
         assert_eq!(bus.check(&subjects[0], DEFAULT).await, Ok(YES));
@@ -1231,7 +1051,7 @@ fn subjects_that_cannot_be_pinned_are_refused() {
                 "cannot identify the subject".to_string()
             )
         );
-        let log = bus.log();
+        let log = bus.shared.log();
         assert!(log.contains("its user changed from 4242 to 0"), "{log}");
         // A process that is gone.
         let gone = Sleeper::start(None);
@@ -1298,7 +1118,7 @@ fn other_users_subjects_and_polkit_details() {
         // Another user may not check root's subjects: a process, a bus name or a session.
         let refused = Err(NOT_AUTHORIZED.to_string());
         let root_pid = me().to_string();
-        let root_name = bus.client.unique_name().unwrap().to_string();
+        let root_name = bus.shared.client.unique_name().unwrap().to_string();
         let as_nobody = |arguments: &[&str]| bus.pkcheck_as(Some("nobody"), arguments);
         assert_eq!(
             as_nobody(&["--action-id", DEFAULT, "--process", &root_pid]),
@@ -1310,8 +1130,9 @@ fn other_users_subjects_and_polkit_details() {
         );
         // pkcheck has no unix-session subjects: busctl sends one.
         let session_as_nobody = |id: &str| {
-            let output = bus.run(
+            let output = bus.shared.run(
                 Some("nobody"),
+                None,
                 "busctl",
                 &[
                     "call",
@@ -1348,8 +1169,9 @@ fn other_users_subjects_and_polkit_details() {
 
         // But it may check itself (no session: allow_any, "no").
         let itself = format!("exec pkcheck --action-id {DEFAULT} --process $$");
-        let run_as_nobody =
-            |script: &str| pkcheck_answer(bus.run(Some("nobody"), "sh", &["-c", script]));
+        let run_as_nobody = |script: &str| {
+            pkcheck_answer(bus.shared.run(Some("nobody"), None, "sh", &["-c", script]))
+        };
         assert_eq!(run_as_nobody(&itself), Ok(PKCHECK_NOT_AUTHORIZED));
         // polkit.* details: only the documented ones, and only from root.
         let with_detail = format!("{itself} --detail polkit.message hello");
@@ -1419,8 +1241,8 @@ fn broken_rules_deny_everything_until_a_reload_fixes_them() {
             bus.pkcheck(DEFAULT, &nobody.pid().to_string()),
             Ok(PKCHECK_NOT_AUTHORIZED)
         );
-        assert!(bus.name_is_owned().await);
-        let log = bus.log();
+        assert!(bus.shared.name_is_owned().await);
+        let log = bus.shared.log();
         assert!(log.contains("unknown field `sesion`"), "{log}");
         // Rate-limited: one message for the four denied checks.
         assert_eq!(log.matches("the rules are broken").count(), 1, "{log}");
@@ -1432,12 +1254,15 @@ fn broken_rules_deny_everything_until_a_reload_fixes_them() {
             .member("Changed")
             .unwrap()
             .build();
-        let mut changes = MessageStream::for_match_rule(changed, &bus.client, None)
+        let mut changes = MessageStream::for_match_rule(changed, &bus.shared.client, None)
             .await
             .unwrap();
 
         // Fixed, then reloaded: normal answers.
-        write_trusted(&bus.directory.join("local/90-local.toml"), "# fixed\n");
+        write_trusted(
+            &bus.shared.directory.join("local/90-local.toml"),
+            "# fixed\n",
+        );
         bus.reload();
         within("Changed", changes.next()).await.unwrap().unwrap();
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
@@ -1447,11 +1272,14 @@ fn broken_rules_deny_everything_until_a_reload_fixes_them() {
         );
 
         // Broken again by a reload: denied again, still owning the name.
-        write_trusted(&bus.directory.join("local/90-local.toml"), BROKEN_RULES);
+        write_trusted(
+            &bus.shared.directory.join("local/90-local.toml"),
+            BROKEN_RULES,
+        );
         bus.reload();
         within("Changed", changes.next()).await.unwrap().unwrap();
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(NO));
-        assert!(bus.name_is_owned().await);
+        assert!(bus.shared.name_is_owned().await);
     });
 }
 
@@ -1476,6 +1304,7 @@ fn actions_properties_and_cancellation() {
             HashMap<String, String>,
         );
         let reply = bus
+            .shared
             .client
             .call_method(
                 Some(NAME),
@@ -1511,7 +1340,7 @@ fn actions_properties_and_cancellation() {
         // no, auth_admin, yes.
         assert_eq!((default.6, default.7, default.8), (0, 2, 5));
 
-        let properties = zbus::fdo::PropertiesProxy::builder(&bus.client)
+        let properties = zbus::fdo::PropertiesProxy::builder(&bus.shared.client)
             .destination(NAME)
             .unwrap()
             .path(PATH)
@@ -1609,7 +1438,7 @@ fn the_limit_per_connection_holds_and_root_has_no_limit_per_user() {
         let me_subject = unix_process(me());
 
         // 32 checks wait on one connection: a 33rd is refused at once.
-        let first = connect(&bus.address).await;
+        let first = connect(&bus.shared.address).await;
         let sent = Instant::now();
         for _ in 0..32 {
             send_check(&first, &slow_subject).await;
@@ -1628,7 +1457,7 @@ fn the_limit_per_connection_holds_and_root_has_no_limit_per_user() {
             .map_err(error_name);
         assert_eq!(on_first, Err(FAILED.to_string()));
         // Another connection has its own 32.
-        let second = connect(&bus.address).await;
+        let second = connect(&bus.shared.address).await;
         for _ in 0..32 {
             send_check(&second, &slow_subject).await;
         }
@@ -1662,7 +1491,7 @@ fn a_user_has_at_most_64_checks_in_flight() {
                     .args(["--reuid=nobody", "--regid=nogroup", "--clear-groups", "--"])
                     .arg("pkcheck")
                     .args(pkcheck_slow)
-                    .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
+                    .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.shared.address)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
@@ -1768,7 +1597,7 @@ fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
         bus.add_session("c2", NOBODY_ACTIVE).await;
         let nobody = Sleeper::start(Some("nobody"));
         bus.place(nobody.pid(), ByPid::Session("c2"));
-        let cgroup = UnitMemoryCgroup::place(bus.daemon.id());
+        let cgroup = UnitMemoryCgroup::place(bus.shared.daemon.id());
         // Not root's: only a check that reaches the rules copies the details.
         let subject = unix_process(nobody.pid());
 
@@ -1778,7 +1607,7 @@ fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
         let details: HashMap<&str, &str> = names.iter().map(|name| (name.as_str(), "")).collect();
         // The daemon copies and parses 31 MiB: under full CPU load that can outlast the client's
         // usual TIMEOUT, so this call gets four times as long (a hang still fails the test).
-        bus.client = zbus::connection::Builder::address(bus.address.as_str())
+        bus.shared.client = zbus::connection::Builder::address(bus.shared.address.as_str())
             .unwrap()
             .method_timeout(TIMEOUT * 4)
             .build()
@@ -1789,7 +1618,11 @@ fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
         assert_eq!(large.map(|(authorized, _, _)| authorized), Ok(true));
         // The same daemon still answers.
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
-        assert!(bus.daemon.try_wait().unwrap().is_none(), "{}", bus.log());
+        assert!(
+            bus.shared.daemon.try_wait().unwrap().is_none(),
+            "{}",
+            bus.shared.log()
+        );
 
         drop(bus);
         drop(cgroup);
@@ -2087,7 +1920,7 @@ impl Harness {
     async fn relay(&self) -> Dialogs {
         let (dialogs, dialogs_received) = async_channel::unbounded();
         let (cancels, cancels_received) = async_channel::unbounded();
-        let relay = zbus::connection::Builder::address(self.address.as_str())
+        let relay = zbus::connection::Builder::address(self.shared.address.as_str())
             .unwrap()
             .serve_at(RELAY_PATH, Relay { dialogs, cancels })
             .unwrap()
@@ -2117,7 +1950,7 @@ impl Harness {
             .args(["--exact", "fake_agent_program", "--ignored", "--nocapture"])
             .args(["--quiet", "--test-threads=1"])
             .env(FAKE_AGENT, spec)
-            .env("DBUS_SYSTEM_BUS_ADDRESS", &self.address)
+            .env("DBUS_SYSTEM_BUS_ADDRESS", &self.shared.address)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -2146,7 +1979,8 @@ impl Harness {
     /// `AuthenticationAgentResponse2` from root, as polkit-agent-helper-1 sends it.
     async fn respond(&self, uid: u32, cookie: &str, identity: u32) -> Result<(), String> {
         let identity = ("unix-user", HashMap::from([("uid", Value::U32(identity))]));
-        self.client
+        self.shared
+            .client
             .call_method(
                 Some(NAME),
                 PATH,
@@ -2161,8 +1995,9 @@ impl Harness {
 
     /// busctl as `user` calling a method of the authority: its exit code and what it printed.
     fn busctl_as(&self, user: &str, method: &str, arguments: &[&str]) -> (Option<i32>, String) {
-        let output = self.run(
+        let output = self.shared.run(
             Some(user),
+            None,
             "busctl",
             &[&["call", NAME, PATH, INTERFACE, method], arguments].concat(),
         );
@@ -2207,7 +2042,7 @@ impl Harness {
 
     /// Waits until the daemon has logged `text`.
     fn logged(&self, text: &str) {
-        wait_until(text, || self.log().contains(text));
+        wait_until(text, || self.shared.log().contains(text));
     }
 }
 
@@ -2238,7 +2073,7 @@ async fn changed_signals(bus: &Harness) -> MessageStream {
         .member("Changed")
         .unwrap()
         .build();
-    MessageStream::for_match_rule(changed, &bus.client, None)
+    MessageStream::for_match_rule(changed, &bus.shared.client, None)
         .await
         .unwrap()
 }
@@ -2306,6 +2141,7 @@ fn an_agent_authenticates_only_with_the_helpers_answer() {
             // The old answer, without the uid, is not supported at all.
             let identity = ("unix-user", HashMap::from([("uid", Value::U32(NOBODY))]));
             let old = bus
+                .shared
                 .client
                 .call_method(
                     Some(NAME),
@@ -2328,7 +2164,7 @@ fn an_agent_authenticates_only_with_the_helpers_answer() {
         };
         let (answer, ()) = futures_lite::future::zip(checking, helping).await;
         assert_eq!(answer, Ok((true, false, no_details())));
-        let log = bus.log();
+        let log = bus.shared.log();
         assert!(log.contains("refused: the caller is not root"), "{log}");
         assert!(
             log.contains("refused: the identity was not offered"),
@@ -2353,7 +2189,7 @@ fn an_agent_authenticates_only_with_the_helpers_answer() {
         assert_eq!(answer, Ok((false, false, dismissed)));
 
         // Cookies are never logged.
-        let log = bus.log();
+        let log = bus.shared.log();
         assert!(!log.contains(UNKNOWN_COOKIE), "{log}");
 
         // A root caller gives the dialog its own text and icon.
@@ -2373,7 +2209,8 @@ fn an_agent_authenticates_only_with_the_helpers_answer() {
 
         // pkcheck --allow-user-interaction, end to end.
         let pid = app.pid().to_string();
-        let mut pkcheck = bus.command(
+        let mut pkcheck = bus.shared.command(
+            None,
             None,
             "pkcheck",
             &[
@@ -2427,7 +2264,7 @@ fn cancelling_or_leaving_closes_the_dialog() {
         assert_eq!(cancelled.map(|_| ()), Err(CANCELLED.to_string()));
 
         // The caller leaves the bus while the dialog is up: the same.
-        let leaving = connect(&bus.address).await;
+        let leaving = connect(&bus.shared.address).await;
         send_interactive_check(&leaving, &subject, SELF).await;
         let dialog = dialogs.next().await;
         leaving.close().await.unwrap();
@@ -2555,6 +2392,7 @@ fn agents_only_get_requests_of_their_own_user() {
 
         // Only the connection that registered an agent unregisters it.
         let unregister = bus
+            .shared
             .client
             .call_method(
                 Some(NAME),
@@ -2603,7 +2441,7 @@ fn temporary_authorizations_keep_their_subject_and_level() {
             .member("Changed")
             .unwrap()
             .build();
-        let mut changes = MessageStream::for_match_rule(changed, &bus.client, None)
+        let mut changes = MessageStream::for_match_rule(changed, &bus.shared.client, None)
             .await
             .unwrap();
 
@@ -2652,6 +2490,7 @@ fn temporary_authorizations_keep_their_subject_and_level() {
         // Listed for its user: by process (root) and by session (nobody, as pkcheck --list-temp
         // asks). Not for another user.
         let listed: Vec<TemporaryAuthorization> = bus
+            .shared
             .client
             .call_method(
                 Some(NAME),
@@ -2697,7 +2536,8 @@ fn temporary_authorizations_keep_their_subject_and_level() {
             .await
             .unwrap();
         let mut changes_now = changed_signals(&bus).await;
-        bus.client
+        bus.shared
+            .client
             .call_method(
                 Some(NAME),
                 PATH,
@@ -2795,7 +2635,7 @@ fn a_reload_during_the_dialog_authorizes_nothing() {
             let dialog = dialogs.next().await;
             assert_eq!(dialog.identities, [BIN, NOBODY]);
             write_trusted(
-                &bus.directory.join("local/50-test.toml"),
+                &bus.shared.directory.join("local/50-test.toml"),
                 "[administrators]\nusers = [\"bin\"]\n",
             );
             bus.reload();
@@ -2815,9 +2655,11 @@ fn a_reload_during_the_dialog_authorizes_nothing() {
             Ok(CHALLENGED)
         );
         assert!(
-            !bus.log().contains("temporary authorization nyra-tmp"),
+            !bus.shared
+                .log()
+                .contains("temporary authorization nyra-tmp"),
             "{}",
-            bus.log()
+            bus.shared.log()
         );
     });
 }
@@ -2846,14 +2688,14 @@ fn waiting_authentications_do_not_fill_a_services_connection() {
 
         // A system service (root) asks on behalf of nobody and of daemon, 16 times each, on one
         // connection: 32 checks wait for their agents.
-        let service = connect(&bus.address).await;
+        let service = connect(&bus.shared.address).await;
         for app in [&nobody_app, &daemon_app] {
             for _ in 0..16 {
                 send_interactive_check(&service, &unix_process(app.pid()), SELF).await;
             }
         }
         wait_until("32 authentications", || {
-            bus.log().matches("waits for an agent").count() == 32
+            bus.shared.log().matches("waits for an agent").count() == 32
         });
         let ask = |subject: Subject, action: &'static str, flags: u32| {
             let service = &service;
@@ -2908,7 +2750,7 @@ fn a_queued_check_goes_to_the_agent_that_serves_it_at_its_turn() {
             // The other check waits for the same agent, which then unregisters, its connection
             // staying on the bus.
             wait_until("the second check waiting", || {
-                bus.log().matches("waits for an agent").count() == 2
+                bus.shared.log().matches("waits for an agent").count() == 2
             });
             assert_eq!(agent.unregister(), "unregistered");
             dialog.dismiss().await;
@@ -2967,7 +2809,7 @@ fn a_check_sent_just_before_leaving_counts_nowhere() {
         // A caller with a check in a dialog sends one more and leaves at once: the second may be
         // handled after the departure. Repeated, as the order is up to the scheduler.
         for _ in 0..40 {
-            let leaving = connect(&bus.address).await;
+            let leaving = connect(&bus.shared.address).await;
             send_interactive_check(&leaving, &subject, SELF).await;
             let dialog = dialogs.next().await;
             send_interactive_check(&leaving, &subject, SELF).await;
@@ -2980,7 +2822,7 @@ fn a_check_sent_just_before_leaving_counts_nowhere() {
             bus.authenticate(&dialogs, &subject, SELF).await,
             Ok((true, false, no_details()))
         );
-        let log = bus.log();
+        let log = bus.shared.log();
         assert!(!log.contains("panicked"), "{log}");
     });
 }
@@ -2990,10 +2832,6 @@ fn a_check_sent_just_before_leaving_counts_nowhere() {
 /// Debian 13's `polkit-agent-helper-1` (polkit 126): installed setuid root, with no socket-activated
 /// service for it, and run by `libpolkit-agent-1` for each dialog (observed).
 const HELPER: &str = "/usr/lib/polkit-1/polkit-agent-helper-1";
-/// The system bus's own address. The setuid helper does not follow the agent's
-/// `DBUS_SYSTEM_BUS_ADDRESS` and connects here (observed: without a bus at this address it fails
-/// with "Error getting authority"), so the test bus listens here too.
-const SYSTEM_BUS_SOCKET: &str = "/run/dbus/system_bus_socket";
 const TEST_USER: &str = "nyra-test-user";
 const TEST_ADMIN: &str = "nyra-test-admin";
 const TEST_ADMINS: &str = "nyra-test-admins";
@@ -3091,7 +2929,12 @@ struct TtyAgent {
 impl TtyAgent {
     /// Starts it and waits until it has registered.
     fn start(bus: &Harness, user: &str, pid: u32) -> Self {
-        let registered = || bus.log().matches("authentication agent registered").count();
+        let registered = || {
+            bus.shared
+                .log()
+                .matches("authentication agent registered")
+                .count()
+        };
         let before = registered();
         let mut script = Command::new("setpriv")
             .args([
@@ -3103,7 +2946,7 @@ impl TtyAgent {
             .args(["script", "--quiet", "--flush", "--return", "--command"])
             .arg(format!("exec pkttyagent --process {pid}"))
             .arg("/dev/null")
-            .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.address)
+            .env("DBUS_SYSTEM_BUS_ADDRESS", &bus.shared.address)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -3196,7 +3039,8 @@ impl Harness {
         if interactive {
             arguments.push("--allow-user-interaction");
         }
-        self.command(None, "pkcheck", &arguments)
+        self.shared
+            .command(None, None, "pkcheck", &arguments)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -3288,11 +3132,14 @@ fn debians_agent_and_helper_check_real_passwords() {
             .find(|line| line.starts_with("polkit\\56temporary_authorization_id="))
             .unwrap_or_else(|| panic!("not kept: {details}"))
             .to_string();
-        let dialogs = bus.log().matches("through the agent of").count();
+        let dialogs = bus.shared.log().matches("through the agent of").count();
         let (answer, details) = pkcheck_finished(bus.start_pkcheck(SELF_KEEP, app.pid(), false));
         assert_eq!(answer, Ok(PKCHECK_AUTHORIZED));
         assert_eq!(details.lines().collect::<Vec<_>>(), [kept.as_str()]);
-        assert_eq!(bus.log().matches("through the agent of").count(), dialogs);
+        assert_eq!(
+            bus.shared.log().matches("through the agent of").count(),
+            dialogs
+        );
 
         // The caller cancels while the password is asked: the caller has its answer at once, and
         // the agent gets CancelAuthentication. pkttyagent acts on it only once its read of the
