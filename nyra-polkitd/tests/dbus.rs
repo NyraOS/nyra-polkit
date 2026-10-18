@@ -1705,6 +1705,14 @@ fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
         // turned into Rust values, they take far more.
         let names: Vec<String> = (0..1_350_000).map(|i| format!("{i:x}")).collect();
         let details: HashMap<&str, &str> = names.iter().map(|name| (name.as_str(), "")).collect();
+        // The daemon copies and parses 31 MiB: under full CPU load that can outlast the client's
+        // usual TIMEOUT, so this call gets four times as long (a hang still fails the test).
+        bus.client = zbus::connection::Builder::address(bus.address.as_str())
+            .unwrap()
+            .method_timeout(TIMEOUT * 4)
+            .build()
+            .await
+            .unwrap();
         let large = bus.check_with(&subject, DEFAULT, details, 0, "").await;
         eprintln!("the daemon's peak memory: {} bytes", cgroup.peak().trim());
         assert_eq!(large.map(|(authorized, _, _)| authorized), Ok(true));

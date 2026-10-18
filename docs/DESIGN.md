@@ -379,7 +379,7 @@ and exit codes of pkcheck(1). The integration tests run it next to Debian 13's `
 | `--system-bus-name`, `-s` NAME | the subject: the owner of a unique bus name |
 | `--detail`, `-d` KEY VALUE | a detail for the check; repeatable |
 | `--allow-user-interaction`, `-u` | the `AllowUserInteraction` flag |
-| `--enable-internal-agent` | not supported (below) |
+| `--enable-internal-agent` | accepted; refused only when an agent is needed (below) |
 | `--list-temp`, `--revoke-temp` | the temporary authorizations of the current session |
 | `--version`, `--help`, `-h` | |
 
@@ -430,7 +430,8 @@ the case for services and scripts.
 **Where it differs from Debian's pkcheck**, on purpose:
 
 - A `--process` field that is not all digits, more than three fields, a PID or start time of 0, or
-  a PID or uid above 2^31 - 1 are malformed (126). Debian's pkcheck reads `1,x`, `1x` and `1,` as
+  a PID or uid above 2^31 - 1 are malformed (126); a process whose real uid is above 2^31 - 1
+  cannot be sent (the subject's `uid` is an `i`) and fails with 127. Debian's pkcheck reads `1,x`, `1x` and `1,` as
   PID 1, uses the first three of `1,2,3,4`, and sends `-5` or `0` to the authority.
 - A second `--action-id`, or a second subject (`--process` or `--system-bus-name`), is malformed:
   which one was meant cannot be known. Debian's pkcheck uses the last one.
