@@ -405,6 +405,25 @@ mod tests {
     }
 
     #[test]
+    fn root_has_the_agent_limit_too_and_leaving_frees_the_slots() {
+        let mut agents = Agents::default();
+        for _ in 0..16 {
+            agents
+                .register(agent(":1.1", 0, session("c1"), true))
+                .unwrap();
+        }
+        assert!(
+            agents
+                .register(agent(":1.1", 0, session("c1"), true))
+                .is_err()
+        );
+        assert_eq!(agents.connection_left(":1.1").len(), 16);
+        agents
+            .register(agent(":1.2", 0, session("c1"), true))
+            .unwrap();
+    }
+
+    #[test]
     fn only_the_registering_connection_unregisters_with_the_same_subject_and_path() {
         let mut agents = Agents::default();
         agents

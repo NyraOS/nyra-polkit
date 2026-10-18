@@ -496,7 +496,7 @@ Threat model:
 | a remote user (SSH) | use their processes left in another user's local session (`su`, `sudo -u` at the seat) | a session of another user is not local, except for root |
 | a local user | write rules | rule files and directories must be root's and not writable by others |
 | a sandboxed app | act as more than its user | it is identified like any other client of the system bus, by the bus |
-| anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user other than root, and 16 agents per user; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
+| anyone | exhaust the daemon | at most 32 checks in flight per connection and 64 per user other than root (the callers' uid), and 16 agents per user, root included; calls to logind time out (10 s); `TasksMax=` in the unit; size limits on files; no recursion on input |
 | a local user | fill a system service's connection with dialogs that never close, so its checks for everyone else fail | checks waiting for an agent leave the connection's 32 and count per subject user (at most 16); beyond that, the challenge without a dialog |
 | an administrator's change | be undone by a dialog opened before it | an authentication that started under rules since reread is not authorized and keeps nothing |
 | a broken or hostile action file | crash or bloat the daemon | parse errors skip the file (its actions stay unknown, so denied); no external DTD or entity loading; node and size limits |
@@ -525,7 +525,9 @@ one user cannot fill a service's connection either. Root is not counted: root's 
 system services (logind, NetworkManager, udisks2...), and a user can make them ask on the user's
 behalf, so one pool shared by all of them would let one user use it up and make every service's
 checks fail for everyone. Each service connection keeps its limit of 32, and users cannot open
-connections as root. Reads of `/proc` and of the user database (NSS, which may be LDAP or SSSD) run
+connections as root. A user has at most 16 agents registered (session, process and fallback
+agents), and root has no exemption there. A call over a limit fails with `Failed`, and the refusal
+is logged at most once per user every 10 s. Reads of `/proc` and of the user database (NSS, which may be LDAP or SSSD) run
 as blocking tasks, off the bus executor, so a slow lookup holds only its own check.
 
 **No memory limit in the unit.** The bus accepts messages up to 32 MiB, and zbus turns a call's
