@@ -530,15 +530,23 @@ agents), and root has no exemption there. A call over a limit fails with `Failed
 is logged at most once per user every 10 s. Reads of `/proc` and of the user database (NSS, which may be LDAP or SSSD) run
 as blocking tasks, off the bus executor, so a slow lookup holds only its own check.
 
-**No memory limit in the unit.** The bus accepts messages up to 32 MiB, and zbus turns a call's
-arguments into Rust values before the daemon sees the call or its size, so one `CheckAuthorization`
-from any user with 32 MiB of small details takes the daemon to about 250 MB for a moment. A
-`MemoryMax=` below that lets any user have the daemon killed (OOM) with one call; repeated, the
-kills hit systemd's start limit and every check then fails for everyone. `MemoryHigh=` only slows
-the daemon until it stops answering. So the unit sets no memory limit: memory is bounded by the
-bus's limits (message size, connections per user) and the checks in flight. An integration test
-sends such a call to the daemon in a cgroup with the unit's memory settings and no swap, and checks
-that the same daemon still answers.
+**Message size.** The bus accepts messages up to 32 MiB, and zbus turns a call's arguments into
+Rust values before the daemon sees the call or its size, so one `CheckAuthorization` from any user
+with 32 MiB of small details took the daemon to about 250 MB for a moment. zbus has no size option,
+but its `ReadHalf` trait sees each message's header before the body is read: `src/bus.rs` wraps the
+bus socket in a read half that reads and throws away any method call over 256 KiB (`MAX_CALL_SIZE`;
+a real check takes under 4 KiB) without deserializing it. zbus gives that read half no way to
+reply, so the caller gets no answer and gives up at its own timeout. Only method calls are
+measured; replies and signals are left to zbus. The integration test sends a call just under and
+one just over the limit, and a 31 MiB one, and checks that the same daemon still answers.
+
+**No memory limit in the unit.** Not until the memory the size cap leaves is measured: before it,
+a `MemoryMax=` below the 250 MB of one large call let any user have the daemon killed (OOM) with
+that call; repeated, the kills hit systemd's start limit and every check then failed for everyone.
+`MemoryHigh=` only slows the daemon until it stops answering. So the unit sets no memory limit:
+memory is bounded by the size cap, the bus's other limits (connections per user) and the checks in
+flight. The integration test runs the daemon in a cgroup with the unit's memory settings and no
+swap, and prints its peak memory.
 
 The files that install it are in `dist/`: the systemd unit (`nyra-polkit.service`, with this
 sandboxing), the bus policy (only `polkitd` may own the name; anyone may call it), the bus

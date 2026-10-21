@@ -10,6 +10,7 @@ use nyra_polkitd::actions::ACTIONS_DIR;
 use nyra_polkitd::authority::{
     AUTHORITY_PATH, Authority, BUS_NAME, Directories, check_policy, load_policy,
 };
+use nyra_polkitd::bus;
 use nyra_polkitd::rules::{IMAGE_RULES_DIR, LOCAL_RULES_DIR};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -118,9 +119,9 @@ async fn serve(directories: Directories) -> Result<(), String> {
     // Broken rules do not stop the daemon: it keeps the name and denies every check until a
     // reload reads valid rules, so clients get an answer, never a missing service.
     let authority = Authority::new(load_policy(&directories));
-    let connection = zbus::connection::Builder::system()
-        .map(|builder| builder.method_timeout(CALL_TIMEOUT))
-        .map_err(|error| error.to_string())?
+    let connection = bus::system_builder()
+        .await?
+        .method_timeout(CALL_TIMEOUT)
         .build()
         .await
         .map_err(|error| format!("system bus: {error}"))?;

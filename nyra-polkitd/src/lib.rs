@@ -11,6 +11,7 @@
 pub mod actions;
 pub mod agents;
 pub mod authority;
+pub mod bus;
 pub mod decision;
 pub mod logind;
 pub mod process;
