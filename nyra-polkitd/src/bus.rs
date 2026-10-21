@@ -15,6 +15,7 @@ use zbus::address::Transport;
 use zbus::address::transport::UnixSocket;
 use zbus::connection::Builder;
 use zbus::connection::socket::{BoxedSplit, ReadHalf, Split};
+use zbus::fdo::ConnectionCredentials;
 
 /// The largest method call (header and body) the daemon accepts. A real check is well under 4 KiB;
 /// this leaves room for many details.
@@ -45,9 +46,10 @@ pub async fn system_builder() -> Result<Builder<'static>, String> {
     Ok(Builder::socket(capped))
 }
 
-/// The read half of the bus socket. It can neither pass file descriptors (the default of
-/// `ReadHalf`, kept on purpose: the daemon needs none) nor reply to a refused call: zbus gives the
-/// read half no way to send. A refused call is dropped; its caller gives up at its own timeout.
+/// The read half of the bus socket. It forwards everything to the inner half (file descriptors
+/// and peer credentials included: the daemon needs pidfds) except that it cannot reply to a
+/// refused call: zbus gives the read half no way to send. A refused call is dropped, with its
+/// file descriptors; its caller gives up at its own timeout.
 #[derive(Debug)]
 struct CallLimit(Box<dyn ReadHalf>);
 
@@ -62,14 +64,20 @@ impl ReadHalf for CallLimit {
         loop {
             while received.len() < PRIMARY_HEADER_SIZE {
                 let mut more = vec![0; PRIMARY_HEADER_SIZE - received.len()];
-                let (read, _) = self.0.recvmsg(&mut more).await?;
+                let (read, new_fds) = self.0.recvmsg(&mut more).await?;
+                fds.extend(new_fds);
                 if read == 0 {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
                 }
                 received.extend_from_slice(&more[..read]);
             }
             match method_call_size(&received[..PRIMARY_HEADER_SIZE]) {
-                Some(size) if size > MAX_CALL_SIZE => self.discard(size, received).await?,
+                Some(size) if size > MAX_CALL_SIZE => {
+                    // No sender or body in the log: the header fields are not read yet.
+                    eprintln!("<4>method call of {size} bytes refused (limit {MAX_CALL_SIZE})");
+                    fds.clear();
+                    self.discard(size, received).await?
+                }
                 // The inner read half starts from the header bytes already read.
                 _ => return self.0.receive_message(seq, received, fds).await,
             }
@@ -78,6 +86,14 @@ impl ReadHalf for CallLimit {
 
     async fn recvmsg(&mut self, buffer: &mut [u8]) -> std::io::Result<(usize, Vec<OwnedFd>)> {
         self.0.recvmsg(buffer).await
+    }
+
+    fn can_pass_unix_fd(&self) -> bool {
+        self.0.can_pass_unix_fd()
+    }
+
+    async fn peer_credentials(&mut self) -> std::io::Result<ConnectionCredentials> {
+        self.0.peer_credentials().await
     }
 }
 
