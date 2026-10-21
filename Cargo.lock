@@ -417,6 +417,7 @@ dependencies = [
  "async-io",
  "async-lock",
  "async-signal",
+ "async-trait",
  "blocking",
  "futures-lite",
  "nix",

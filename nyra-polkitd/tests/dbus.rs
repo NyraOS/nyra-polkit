@@ -27,6 +27,7 @@ mod harness;
 
 use futures_lite::StreamExt;
 use harness::{TIMEOUT, connect, wait_until, write_trusted};
+use nyra_polkitd::bus::MAX_CALL_SIZE;
 use nyra_polkitd::process::Process;
 use std::collections::HashMap;
 use std::fs::File;
@@ -1591,7 +1592,7 @@ impl Drop for UnitMemoryCgroup {
 
 #[test]
 #[ignore = "needs root, dbus-daemon and a writable /sys/fs/cgroup: run by the integration job"]
-fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
+fn a_call_over_the_size_limit_is_dropped_and_the_daemon_keeps_serving() {
     futures_lite::future::block_on(async {
         let mut bus = Harness::start("large-call", "").await;
         bus.add_session("c2", NOBODY_ACTIVE).await;
@@ -1601,22 +1602,43 @@ fn a_call_as_large_as_the_bus_allows_does_not_stop_the_daemon() {
         // Not root's: only a check that reaches the rules copies the details.
         let subject = unix_process(nobody.pid());
 
-        // About 31 MiB of details (24 bytes each on the wire), under the bus's 32 MiB per message:
-        // turned into Rust values, they take far more.
-        let names: Vec<String> = (0..1_350_000).map(|i| format!("{i:x}")).collect();
-        let details: HashMap<&str, &str> = names.iter().map(|name| (name.as_str(), "")).collect();
-        // The daemon copies and parses 31 MiB: under full CPU load that can outlast the client's
-        // usual TIMEOUT, so this call gets four times as long (a hang still fails the test).
+        // One detail whose value takes the rest of the call; the other arguments take far less
+        // than the 4 KiB left under the limit.
+        let under = "x".repeat(MAX_CALL_SIZE - 4096);
+        let over = "x".repeat(MAX_CALL_SIZE + 1);
+        let answer = bus
+            .check_with(
+                &subject,
+                DEFAULT,
+                HashMap::from([("k", under.as_str())]),
+                0,
+                "",
+            )
+            .await;
+        assert_eq!(answer.map(|(authorized, _, _)| authorized), Ok(true));
+
+        // A dropped call gets no reply: its caller gives up at its own timeout.
         bus.shared.client = zbus::connection::Builder::address(bus.shared.address.as_str())
             .unwrap()
-            .method_timeout(TIMEOUT * 4)
+            .method_timeout(Duration::from_secs(2))
             .build()
             .await
             .unwrap();
-        let large = bus.check_with(&subject, DEFAULT, details, 0, "").await;
+        // About 31 MiB of details (24 bytes each on the wire), under the bus's 32 MiB per message:
+        // turned into Rust values, they would take far more.
+        let names: Vec<String> = (0..1_350_000).map(|i| format!("{i:x}")).collect();
+        let many: HashMap<&str, &str> = names.iter().map(|name| (name.as_str(), "")).collect();
+        for details in [HashMap::from([("k", over.as_str())]), many] {
+            let dropped = bus.call_check(&subject, DEFAULT, details, 0, "").await;
+            assert!(
+                matches!(&dropped, Err(zbus::Error::InputOutput(error))
+                    if error.kind() == std::io::ErrorKind::TimedOut),
+                "{dropped:?}"
+            );
+        }
         eprintln!("the daemon's peak memory: {} bytes", cgroup.peak().trim());
-        assert_eq!(large.map(|(authorized, _, _)| authorized), Ok(true));
-        // The same daemon still answers.
+
+        // The same daemon, and the same connection, still answer.
         assert_eq!(bus.check(&subject, DEFAULT).await, Ok(YES));
         assert!(
             bus.shared.daemon.try_wait().unwrap().is_none(),
