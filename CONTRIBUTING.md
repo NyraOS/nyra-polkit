@@ -13,11 +13,15 @@ nyra-polkit decides who may do what on a Nyra OS machine, so the rules are stric
   Every change is reviewed before it is merged (`.github/CODEOWNERS`).
 - **One change per pull request**, small and with a clear reason. Prefer the simplest solution that
   works; no options or abstractions "for later".
-- **Code rules** (for everyone, people and agents alike; reviews check them):
-  - **Rust:** the code must be easy to read, without needless complication. A reader who knows
-    Rust understands a function without jumping through five files; names say what a thing is;
-    generics, traits, macros or `unsafe` only when really needed, with the reason written next to
-    them; plain code instead of an abstraction used once; comments say why, not what.
+- **Code rules** (for everyone, people and agents alike; reviews check them). KISS: code a person
+  can read, top to bottom, without jumping through five files.
+  - Functions about 50 lines at most, files short; each file starts with a short header saying
+    what it does and why it exists; names say what a thing is; comments say why, not what.
+  - **Rust:** plain `match` and loops instead of long iterator chains; no macros; generics, traits,
+    explicit lifetimes, `dyn` or `unsafe` only when really needed, with the reason written next to
+    them; plain code instead of an abstraction used once. The code has no `unsafe` today.
+  - A dependency that makes the code clearer is fine; do not write your own replacement to avoid
+    one without a reason. No options or layers "for later".
 - **Fail closed.** Anything the daemon cannot determine (a subject, a session, a rule file) ends in
   a denial, never in a grant.
 - **Few dependencies.** Each one is justified next to it in `Cargo.toml`; `cargo deny` checks
